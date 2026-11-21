@@ -34,6 +34,8 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 // ---------------------------------------------------------------------------
 
 struct HugeAlloc;
+/// Whether to request transparent huge pages (MADV_HUGEPAGE); see `main`.
+static USE_THP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 const ARENA_MIN: usize = 16 << 10; // [ARENA_MIN, BIG): per-thread huge-page bump arenas
 const BIG: usize = 4 << 20; // >= BIG: dedicated mmap
 const HUGE: usize = 2 << 20;
@@ -57,7 +59,7 @@ unsafe fn big_map(size: usize) -> *mut u8 {
     if p == libc::MAP_FAILED {
         return std::ptr::null_mut();
     }
-    if len >= HUGE {
+    if len >= HUGE && USE_THP.load(std::sync::atomic::Ordering::Relaxed) {
         libc::madvise(p, len, libc::MADV_HUGEPAGE);
     }
     p as *mut u8
@@ -160,7 +162,9 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
             if q == libc::MAP_FAILED {
                 return std::ptr::null_mut();
             }
-            libc::madvise(q, round_up(new_size), libc::MADV_HUGEPAGE);
+            if USE_THP.load(std::sync::atomic::Ordering::Relaxed) {
+                libc::madvise(q, round_up(new_size), libc::MADV_HUGEPAGE);
+            }
             return q as *mut u8;
         }
         if co == 1 && cn == 1 {
@@ -659,6 +663,17 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
         return None;
     }
     let mut v: i64 = 0;
+    if n <= 18 {
+        // cannot overflow i64
+        for &b in s {
+            let d = b.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            v = v * 10 + d as i64;
+        }
+        return Some(v);
+    }
     for &b in s {
         let d = b.wrapping_sub(b'0');
         if d > 9 {
@@ -695,7 +710,31 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 // beyond one partial block). Blocks come from the huge-page arena allocator.
 // ---------------------------------------------------------------------------
 
-const BCAP: usize = 512;
+/// Every block is BLOCK_BYTES regardless of element type, so blocks freed by one phase
+/// (event-id buckets after dedup) are reused by the next (person buckets) without new page
+/// faults.
+const BLOCK_BYTES: usize = 24 << 10;
+
+thread_local! {
+    static FREE_BLOCKS: std::cell::UnsafeCell<Vec<usize>> = const { std::cell::UnsafeCell::new(Vec::new()) };
+}
+
+#[inline(always)]
+fn block_layout() -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(BLOCK_BYTES, 64).unwrap()
+}
+
+fn alloc_block() -> *mut u8 {
+    let reused = FREE_BLOCKS.with(|f| unsafe { (*f.get()).pop() });
+    if let Some(p) = reused {
+        return p as *mut u8;
+    }
+    let p = unsafe { std::alloc::alloc(block_layout()) };
+    if p.is_null() {
+        std::alloc::handle_alloc_error(block_layout());
+    }
+    p
+}
 
 struct BlockVec<T: Copy> {
     blocks: Vec<*mut T>,
@@ -705,6 +744,8 @@ unsafe impl<T: Copy + Send> Send for BlockVec<T> {}
 unsafe impl<T: Copy + Sync> Sync for BlockVec<T> {}
 
 impl<T: Copy> BlockVec<T> {
+    const CAP: usize = BLOCK_BYTES / std::mem::size_of::<T>();
+
     fn new() -> Self {
         BlockVec { blocks: Vec::new(), len: 0 }
     }
@@ -714,32 +755,44 @@ impl<T: Copy> BlockVec<T> {
     }
     #[inline(always)]
     fn push(&mut self, v: T) {
-        let off = self.len % BCAP;
+        let off = self.len % Self::CAP;
         if off == 0 {
-            let l = std::alloc::Layout::array::<T>(BCAP).unwrap().align_to(64).unwrap();
-            let p = unsafe { std::alloc::alloc(l) } as *mut T;
-            if p.is_null() {
-                std::alloc::handle_alloc_error(l);
-            }
-            self.blocks.push(p);
+            self.blocks.push(alloc_block() as *mut T);
         }
         unsafe { self.blocks.last().unwrap_unchecked().add(off).write(v) };
         self.len += 1;
     }
     #[inline(always)]
+    fn block_len(&self, i: usize) -> usize {
+        if i + 1 == self.blocks.len() { self.len - i * Self::CAP } else { Self::CAP }
+    }
+    /// Raw (pointer, length) of each block, for in-place updates.
+    fn raw_blocks(&self) -> impl Iterator<Item = (*mut T, usize)> + '_ {
+        (0..self.blocks.len()).map(move |i| (self.blocks[i], self.block_len(i)))
+    }
+    #[inline(always)]
     fn block(&self, i: usize) -> &[T] {
-        let n = if i + 1 == self.blocks.len() { self.len - i * BCAP } else { BCAP };
-        unsafe { std::slice::from_raw_parts(self.blocks[i], n) }
+        unsafe { std::slice::from_raw_parts(self.blocks[i], self.block_len(i)) }
     }
     fn iter(&self) -> impl Iterator<Item = &T> + '_ {
         (0..self.blocks.len()).flat_map(move |i| self.block(i).iter())
+    }
+    /// Hands this list's blocks to the calling thread's free list.
+    /// Safety: the contents must never be read again.
+    unsafe fn recycle(&self) {
+        FREE_BLOCKS.with(|f| {
+            let fl = &mut *f.get();
+            for &b in &self.blocks {
+                fl.push(b as usize);
+            }
+        });
     }
 }
 impl<T: Copy> std::ops::Index<usize> for BlockVec<T> {
     type Output = T;
     #[inline(always)]
     fn index(&self, i: usize) -> &T {
-        unsafe { &*self.blocks[i / BCAP].add(i % BCAP) }
+        unsafe { &*self.blocks[i / Self::CAP].add(i % Self::CAP) }
     }
 }
 // Blocks are intentionally never freed: the process exits right after writing output.
@@ -748,34 +801,29 @@ impl<T: Copy> std::ops::Index<usize> for BlockVec<T> {
 // Records
 // ---------------------------------------------------------------------------
 
-const F_VALID: u8 = 1;
-const F_PURCHASE: u8 = 2;
+const TS_NONE: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 struct ERec {
     eid: Key,
     user: Key,
-    ts: i64,
     ingest: i64,
-    price: u32,
-    cat: u16,
-    flags: u8,
+    ts: u32, // ms since `base` (click window start); TS_NONE = invalid or losing copy
+    pc: u32, // price << 8 | category (price 0 = not a purchase)
 }
 
 #[derive(Clone, Copy)]
 struct PRec {
     person: Key,
-    ts: i64,
-    price: u32,
-    cat: u16,
-    flags: u8,
+    ts: u32,
+    pc: u32,
 }
 
 #[derive(Clone, Copy)]
 struct CRec {
     person: Key,
     click: Key,
-    ts: i64,
+    ts: u32,
     camp: u32,
 }
 
@@ -909,6 +957,9 @@ fn read_small_csv2(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 fn main() {
+    if std::env::var_os("NOTHP").is_some() {
+        USE_THP.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Err(e) = run() {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -982,6 +1033,14 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let win_end = parse_ts(we.as_bytes()).ok_or("bad window_end")?;
     let click_start = win_start - WEEK_MS;
     let day0 = win_start.div_euclid(DAY_MS);
+    // Timestamps are stored as u32 ms offsets from `base`, categories in 8 bits.
+    let base = click_start;
+    if win_end - base >= TS_NONE as i64 || win_end <= win_start {
+        return Err("window too long for compact timestamps".into());
+    }
+    if cat_names.len() > 256 {
+        return Err("more than 255 product categories".into());
+    }
     let ndays = ((win_end - 1).div_euclid(DAY_MS) - day0 + 1).max(1) as usize;
 
     // --- 2. map all inputs -------------------------------------------------
@@ -1169,15 +1228,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         None => return,
                     };
                     let eid = key_fast(f[0], end);
-                    let mut rec = ERec {
-                        eid,
-                        user: Key::default(),
-                        ts: 0,
-                        ingest,
-                        price: 0,
-                        cat: 0,
-                        flags: 0,
-                    };
+                    let mut rec = ERec { eid, user: Key::default(), ingest, ts: TS_NONE, pc: 0 };
                     let ty = f[4];
                     let ok_type = ty == b"view" || ty == b"cart";
                     let purchase = ty == b"purchase";
@@ -1188,16 +1239,14 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 if purchase {
                                     match parse_price(f[6]) {
                                         Some(p) => {
-                                            rec.price = p;
-                                            rec.cat = product_cat.get(&key_fast(f[5], end)).copied().unwrap_or(0);
-                                            rec.flags |= F_PURCHASE;
+                                            let cat = product_cat.get(&key_fast(f[5], end)).copied().unwrap_or(0);
+                                            rec.pc = (p << 8) | cat as u32;
                                         }
                                         None => valid = false,
                                     }
                                 }
                                 if valid {
-                                    rec.flags |= F_VALID;
-                                    rec.ts = ts;
+                                    rec.ts = (ts - base) as u32;
                                     rec.user = key_fast(f[1], end);
                                 }
                             }
@@ -1212,7 +1261,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lg(&format!("events parsed ({} event buckets)", ne));
     struct CState {
         ck: Vec<BlockVec<CRec>>,
-        pend: Vec<(Key, u64, Key, i64, u32)>,
+        pend: Vec<(Key, u64, Key, u32, u32)>,
     }
     #[inline(always)]
     fn flush_clicks(st: &mut CState, pmap: &PMap) {
@@ -1245,7 +1294,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let user = key_fast(f[1], end);
                 let h = khash(user);
                 pmap.prefetch(h);
-                st.pend.push((user, h, key_fast(f[0], end), ts, camp));
+                st.pend.push((user, h, key_fast(f[0], end), (ts - base) as u32, camp));
                 if st.pend.len() == 32 {
                     flush_clicks(st, &pmap);
                 }
@@ -1259,21 +1308,33 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dstates = pool(
         nt,
         ne,
-        || ((0..NP).map(|_| BlockVec::<PRec>::new()).collect::<Vec<_>>(), kmap::<(i64, u32, u32)>(0)),
+        || ((0..NP).map(|_| BlockVec::<PRec>::new()).collect::<Vec<_>>(), kmap::<usize>(0)),
         |st, b| {
             let (out, table) = st;
             table.clear();
             let total: usize = pstates.iter().map(|s| s.ev[b].len()).sum();
             table.reserve(total);
-            for (si, s) in pstates.iter().enumerate() {
-                for (ri, r) in s.ev[b].iter().enumerate() {
-                    match table.entry(r.eid) {
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            v.insert((r.ingest, si as u32, ri as u32));
-                        }
-                        std::collections::hash_map::Entry::Occupied(mut o) => {
-                            if r.ingest < o.get().0 {
-                                o.insert((r.ingest, si as u32, ri as u32));
+            // Insert pass: on a collision the copy with the larger ingest_ts is marked dead
+            // right away (equal ingest_ts copies are identical, so either may die).
+            // Records of bucket b are only touched by this task.
+            for s in pstates.iter() {
+                for (base, n) in s.ev[b].raw_blocks() {
+                    for k in 0..n {
+                        unsafe {
+                            let rp = base.add(k);
+                            match table.entry((*rp).eid) {
+                                std::collections::hash_map::Entry::Vacant(v) => {
+                                    v.insert(rp as usize);
+                                }
+                                std::collections::hash_map::Entry::Occupied(mut o) => {
+                                    let op = *o.get() as *mut ERec;
+                                    if (*rp).ingest < (*op).ingest {
+                                        (*op).ts = TS_NONE;
+                                        o.insert(rp as usize);
+                                    } else {
+                                        (*rp).ts = TS_NONE;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1281,36 +1342,30 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             // Sequential scan; resolve persons in batches with prefetching.
             let mut cand = [(0u32, 0u64); 32];
-            for (si, src) in pstates.iter().enumerate() {
+            for src in pstates.iter() {
                 let v = &src.ev[b];
                 let mut ri = 0usize;
                 while ri < v.len() {
                     let mut n = 0usize;
                     while ri < v.len() && n < 32 {
                         let r = &v[ri];
-                        if r.flags & F_VALID != 0 {
-                            let w = table[&r.eid];
-                            if w.1 == si as u32 && w.2 == ri as u32 {
-                                let h = khash(r.user);
-                                pmap.prefetch(h);
-                                cand[n] = (ri as u32, h);
-                                n += 1;
-                            }
+                        if r.ts != TS_NONE {
+                            let h = khash(r.user);
+                            pmap.prefetch(h);
+                            cand[n] = (ri as u32, h);
+                            n += 1;
                         }
                         ri += 1;
                     }
                     for &(ci, h) in &cand[..n] {
                         let r = &v[ci as usize];
                         let person = pmap.get(r.user, h);
-                        out[pbucket(khash(person))].push(PRec {
-                            person,
-                            ts: r.ts,
-                            price: r.price,
-                            cat: r.cat,
-                            flags: r.flags,
-                        });
+                        out[pbucket(khash(person))].push(PRec { person, ts: r.ts, pc: r.pc });
                     }
                 }
+            }
+            for src in pstates.iter() {
+                unsafe { src.ev[b].recycle() };
             }
         },
     );
@@ -1319,15 +1374,13 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- 6. sessionize per person bucket ------------------------------------
     #[derive(Clone, Copy, Default)]
     struct SEv {
-        ts: i64,
-        price: u32,
-        cat: u16,
-        flags: u8,
+        ts: u32,
+        pc: u32,
     }
     #[derive(Clone, Copy, Default)]
     struct SClk {
-        ts: i64,
         click: Key,
+        ts: u32,
         camp: u32,
     }
     struct SState {
@@ -1400,7 +1453,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         k += 1;
                         let pos = st.eoff[id] as usize;
                         st.eoff[id] += 1;
-                        st.sev[pos] = SEv { ts: r.ts, price: r.price, cat: r.cat, flags: r.flags };
+                        st.sev[pos] = SEv { ts: r.ts, pc: r.pc };
                     }
                 }
             }
@@ -1445,7 +1498,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
                         let pos = st.coff[id as usize] as usize;
                         st.coff[id as usize] += 1;
-                        st.sck[pos] = SClk { ts: c.ts, click: c.click, camp: c.camp };
+                        st.sck[pos] = SClk { click: c.click, ts: c.ts, camp: c.camp };
                     }
                 }
             }
@@ -1493,22 +1546,23 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let mut j = 0usize;
                 let m = pev.len();
                 while j < m {
-                    let start = pev[j].ts;
+                    let start = pev[j].ts as i64;
                     let mut last = start;
                     let mut cnt = 0i64;
                     let mut rev = 0i64;
                     let mut purch = false;
                     let js = j;
-                    while j < m && pev[j].ts - last <= GAP_MS {
-                        last = pev[j].ts;
+                    while j < m && pev[j].ts as i64 - last <= GAP_MS {
+                        last = pev[j].ts as i64;
                         cnt += 1;
-                        if pev[j].flags & F_PURCHASE != 0 {
+                        let price = pev[j].pc >> 8;
+                        if price != 0 {
                             purch = true;
-                            rev += pev[j].price as i64;
+                            rev += price as i64;
                         }
                         j += 1;
                     }
-                    let day = start.div_euclid(DAY_MS);
+                    let day = (base + start).div_euclid(DAY_MS);
                     if day != cur_day {
                         if cur_day != i64::MIN {
                             drow.top = top_cat(&st.catacc, &cat_rank);
@@ -1526,10 +1580,12 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     drow.revenue += rev;
                     if purch {
                         for e in &pev[js..j] {
-                            if e.flags & F_PURCHASE != 0 {
-                                match st.catacc.iter_mut().find(|x| x.0 == e.cat) {
-                                    Some(x) => x.1 += e.price as i64,
-                                    None => st.catacc.push((e.cat, e.price as i64)),
+                            let price = (e.pc >> 8) as i64;
+                            if price != 0 {
+                                let cat = (e.pc & 0xFF) as u16;
+                                match st.catacc.iter_mut().find(|x| x.0 == cat) {
+                                    Some(x) => x.1 += price,
+                                    None => st.catacc.push((cat, price)),
                                 }
                             }
                         }
@@ -1537,13 +1593,13 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
                     // clicks window [start - 7d, start]; session starts are increasing
                     let wlo = start - WEEK_MS;
-                    while lo < pck.len() && pck[lo].ts < wlo {
+                    while lo < pck.len() && (pck[lo].ts as i64) < wlo {
                         lo += 1;
                     }
                     if hi < lo {
                         hi = lo;
                     }
-                    while hi < pck.len() && pck[hi].ts <= start {
+                    while hi < pck.len() && (pck[hi].ts as i64) <= start {
                         hi += 1;
                     }
                     let di = (day - day0) as usize;
