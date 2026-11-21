@@ -936,26 +936,37 @@ struct Chunk {
     end: usize,
 }
 
+/// Splits every file into fixed byte ranges (no data is touched here). A range owns exactly
+/// the lines that start inside it; `chunk_lines` finds them.
 fn make_chunks(maps: &[Mmap], kind_of: &[u8], out: &mut Vec<(u8, Chunk)>) {
     for (fi, m) in maps.iter().enumerate() {
-        let b = &m[..];
-        // skip header
-        let mut start = match memchr::memchr(b'\n', b) {
-            Some(p) => p + 1,
-            None => continue,
-        };
-        while start < b.len() {
-            let mut end = (start + CHUNK).min(b.len());
-            if end < b.len() {
-                end = match memchr::memchr(b'\n', &b[end..]) {
-                    Some(p) => end + p + 1,
-                    None => b.len(),
-                };
-            }
+        let len = m.len();
+        let mut start = 0;
+        while start < len {
+            let end = (start + CHUNK).min(len);
             out.push((kind_of[fi], Chunk { file: fi, start, end }));
             start = end;
         }
     }
+}
+
+/// The whole lines owned by byte range [start, end) of `m`: the first is the one after the
+/// first '\n' at or after `start - 1` (for start 0 this skips the header line), the last is
+/// the one containing byte `end - 1`.
+fn chunk_lines(m: &[u8], c: Chunk) -> &[u8] {
+    let from = if c.start == 0 { 0 } else { c.start - 1 };
+    let first = match memchr::memchr(b'\n', &m[from..]) {
+        Some(p) => from + p + 1,
+        None => return &[],
+    };
+    if first >= c.end {
+        return &[];
+    }
+    let stop = match memchr::memchr(b'\n', &m[c.end - 1..]) {
+        Some(q) => c.end + q,
+        None => m.len(),
+    };
+    &m[first..stop]
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,21 +1019,37 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let nt = nthreads();
 
     // --- 1. small inputs ---------------------------------------------------
+    // products.csv parsed in place: categories are few, so a linear scan over the
+    // distinct names beats hashing each one; no per-line allocations.
     let mut cat_names: Vec<Vec<u8>> = vec![b"unknown".to_vec()];
-    let mut cat_ids: HashMap<Vec<u8>, u16> = HashMap::new();
-    cat_ids.insert(b"unknown".to_vec(), 0);
     let mut product_cat: KMap<u16> = kmap(1 << 16);
-    for (pid, cat) in read_small_csv2(&data.join("products.csv")) {
-        let id = match cat_ids.get(&cat) {
-            Some(&id) => id,
-            None => {
-                let id = cat_names.len() as u16;
-                cat_names.push(cat.clone());
-                cat_ids.insert(cat, id);
-                id
-            }
+    {
+        let pdata = std::fs::read(data.join("products.csv")).unwrap_or_default();
+        let body = match memchr::memchr(b'\n', &pdata) {
+            Some(p) => &pdata[p + 1..],
+            None => &[][..],
         };
-        product_cat.insert(key_of(&pid), id);
+        let mut last: Option<u16> = None; // last category seen
+        for_each_line::<2, _>(body, |f| {
+            if f[0].is_empty() || f[1].is_empty() {
+                return;
+            }
+            let id = match last {
+                Some(id) if cat_names[id as usize] == f[1] => id,
+                _ => {
+                    let id = match cat_names.iter().position(|c| c.as_slice() == f[1]) {
+                        Some(i) => i as u16,
+                        None => {
+                            cat_names.push(f[1].to_vec());
+                            (cat_names.len() - 1) as u16
+                        }
+                    };
+                    last = Some(id);
+                    id
+                }
+            };
+            product_cat.insert(key_of(f[0]), id);
+        });
     }
     // rank of each category by byte-wise name (lower rank wins ties)
     let mut order: Vec<usize> = (0..cat_names.len()).collect();
@@ -1107,7 +1134,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             || (0u32, (0..LP).map(|_| Vec::<(Key, u32)>::new()).collect::<Vec<_>>()),
             |st, i| {
                 let c = link_chunks[i];
-                let b = &maps[c.file][c.start..c.end];
+                let b = chunk_lines(&maps[c.file], c);
                 for_each_line::<2, _>(b, |f| {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
@@ -1238,7 +1265,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             || PState { ev: (0..ne).map(|_| BlockVec::new()).collect() },
             |st, i| {
                 let c = ev_chunks[i];
-                let b = &maps[c.file][c.start..c.end];
+                let b = chunk_lines(&maps[c.file], c);
                 let end = b.as_ptr() as usize + b.len();
                 for_each_line::<7, _>(b, |f| {
                     if f[0].is_empty() {
@@ -1298,7 +1325,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         || CState { ck: (0..NP).map(|_| BlockVec::new()).collect(), pend: Vec::with_capacity(32) },
         |st, i| {
             let c = ck_chunks[i];
-            let b = &maps[c.file][c.start..c.end];
+            let b = chunk_lines(&maps[c.file], c);
             let end = b.as_ptr() as usize + b.len();
             for_each_line::<4, _>(b, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
@@ -2022,6 +2049,44 @@ mod tests {
             check_tokenizer::<2>(seed * 7919);
             check_tokenizer::<4>(seed * 104729);
             check_tokenizer::<7>(seed * 1299709);
+        }
+    }
+    #[test]
+    fn chunk_lines_partition_every_line_exactly_once() {
+        let mut x: u64 = 0x1234_5678_9ABC_DEF1;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..20_000 {
+            let mut buf = Vec::new();
+            for _ in 0..(rnd() % 10) {
+                for _ in 0..(rnd() % 30) {
+                    buf.push(b'a' + (rnd() % 3) as u8);
+                }
+                buf.push(b'\n');
+            }
+            if rnd() % 2 == 0 && !buf.is_empty() {
+                buf.pop();
+            }
+            if buf.is_empty() {
+                continue;
+            }
+            let expect: &[u8] = match buf.iter().position(|&c| c == b'\n') {
+                Some(p) => &buf[p + 1..],
+                None => &[],
+            };
+            let size = 1 + (rnd() % 40) as usize;
+            let mut got = Vec::new();
+            let mut start = 0;
+            while start < buf.len() {
+                let end = (start + size).min(buf.len());
+                got.extend_from_slice(chunk_lines(&buf, Chunk { file: 0, start, end }));
+                start = end;
+            }
+            assert_eq!(got, expect, "size {size} buf {:?}", String::from_utf8_lossy(&buf));
         }
     }
 }
