@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -195,9 +195,7 @@ const WEEK_MS: i64 = 7 * DAY_MS;
 const GAP_MS: i64 = 1_800_000;
 const CHUNK: usize = 2 << 20;
 
-const E_BITS: u32 = 10; // event-id buckets
 const P_BITS: u32 = 10; // person buckets
-const NE: usize = 1 << E_BITS;
 const NP: usize = 1 << P_BITS;
 
 // ---------------------------------------------------------------------------
@@ -343,8 +341,8 @@ fn khash(k: Key) -> u64 {
 
 // Bucket index uses middle bits so hashbrown (low bits = slot, top 7 = tag) still sees entropy.
 #[inline(always)]
-fn ebucket(h: u64) -> usize {
-    ((h >> 40) as usize) & (NE - 1)
+fn ebucket(h: u64, mask: usize) -> usize {
+    ((h >> 40) as usize) & mask
 }
 #[inline(always)]
 fn pbucket(h: u64) -> usize {
@@ -512,8 +510,8 @@ fn for_each_line<const N: usize, F: FnMut(&[&[u8]; N])>(buf: &[u8], mut f: F) {
         let blk: &[u8; 64] = if base + 64 <= len {
             buf[base..base + 64].try_into().unwrap()
         } else {
-            tail = [0u8; 64];
             tail[..len - base].copy_from_slice(&buf[base..]);
+            tail[len - base..].fill(0);
             &tail
         };
         let (mut cm, mut nm, mut qm) = delim_masks(blk);
@@ -1017,15 +1015,16 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- 3. links -> person names (runs concurrently with event parsing) ----
     const LP: usize = 64;
     let lpart = |h: u64| ((h >> 40) as usize) & (LP - 1);
-    let lt = 2usize.min(nt);
+    let lt = 3usize.min(nt);
     let build_links = || -> PMap {
         // --- 3. links -> person names -------------------------------------------
 
-        // parse pairs; also scatter endpoint keys by partition
+        // Parse pairs: each endpoint goes to its key partition tagged with its slot
+        // (2 * thread-local pair index + side); pairs themselves are only counted.
         let link_states = pool(
             lt,
             link_chunks.len(),
-            || (Vec::<(Key, Key)>::new(), (0..LP).map(|_| Vec::<Key>::new()).collect::<Vec<_>>()),
+            || (0u32, (0..LP).map(|_| Vec::<(Key, u32)>::new()).collect::<Vec<_>>()),
             |st, i| {
                 let c = link_chunks[i];
                 let b = &maps[c.file][c.start..c.end];
@@ -1035,39 +1034,45 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     let a = key_of(f[0]);
                     let bk = key_of(f[1]);
-                    st.0.push((a, bk));
-                    st.1[lpart(khash(a))].push(a);
-                    st.1[lpart(khash(bk))].push(bk);
+                    let slot = st.0 * 2;
+                    st.0 += 1;
+                    st.1[lpart(khash(a))].push((a, slot));
+                    st.1[lpart(khash(bk))].push((bk, slot + 1));
                 });
             },
         );
+        let mut toff = vec![0usize; link_states.len() + 1];
+        for (t, s) in link_states.iter().enumerate() {
+            toff[t + 1] = toff[t] + s.0 as usize;
+        }
+        let npairs = toff[link_states.len()];
 
-        // per partition: unique keys -> local index
-        let part_keys: Vec<Mutex<(KMap<u32>, Vec<Key>)>> = (0..LP).map(|_| Mutex::new((kmap(0), Vec::new()))).collect();
+        // Per partition: unique keys -> local index; record each endpoint's
+        // (partition, local index) at its pair slot while inserting.
+        let ends: Vec<AtomicU32> = (0..npairs * 2).map(|_| AtomicU32::new(0)).collect();
+        let part_keys: Vec<Mutex<Vec<Key>>> = (0..LP).map(|_| Mutex::new(Vec::new())).collect();
         pool(lt, LP, || (), |_, p| {
             let total: usize = link_states.iter().map(|s| s.1[p].len()).sum();
             let mut m: KMap<u32> = kmap(total / 2 + 16);
             let mut keys = Vec::new();
-            for s in &link_states {
-                for &k in &s.1[p] {
-                    m.entry(k).or_insert_with(|| {
+            for (t, s) in link_states.iter().enumerate() {
+                let base = toff[t] * 2;
+                for &(k, slot) in &s.1[p] {
+                    let local = *m.entry(k).or_insert_with(|| {
                         keys.push(k);
                         (keys.len() - 1) as u32
                     });
+                    ends[base + slot as usize].store(((p as u32) << 26) | local, Ordering::Relaxed);
                 }
             }
-            *part_keys[p].lock().unwrap() = (m, keys);
+            *part_keys[p].lock().unwrap() = keys;
         });
-        let mut part_keys: Vec<(KMap<u32>, Vec<Key>)> = part_keys.into_iter().map(|m| m.into_inner().unwrap()).collect();
+        let mut part_keys: Vec<Vec<Key>> = part_keys.into_iter().map(|m| m.into_inner().unwrap()).collect();
         let mut offs = vec![0u32; LP + 1];
         for p in 0..LP {
-            offs[p + 1] = offs[p] + part_keys[p].1.len() as u32;
+            offs[p + 1] = offs[p] + part_keys[p].len() as u32;
         }
         let nnodes = offs[LP] as usize;
-        let gidx = |pk: &Vec<(KMap<u32>, Vec<Key>)>, k: Key| -> u32 {
-            let p = lpart(khash(k));
-            offs[p] + pk[p].0[&k]
-        };
 
         // union-find
         let mut parent: Vec<u32> = (0..nnodes as u32).collect();
@@ -1079,25 +1084,17 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             x
         }
-        {
-            let pk = &part_keys;
-            let idx_pairs: Vec<Vec<(u32, u32)>> = pool(lt, link_states.len(), Vec::new, |v: &mut Vec<Vec<(u32, u32)>>, i| {
-                v.push(link_states[i].0.iter().map(|&(a, b)| (gidx(pk, a), gidx(pk, b))).collect());
-            })
-            .into_iter()
-            .flatten()
-            .collect();
-            for v in &idx_pairs {
-                for &(a, b) in v {
-                    let ra = find(&mut parent, a);
-                    let rb = find(&mut parent, b);
-                    if ra != rb {
-                        if ra < rb {
-                            parent[rb as usize] = ra;
-                        } else {
-                            parent[ra as usize] = rb;
-                        }
-                    }
+        let dec = |e: u32| offs[(e >> 26) as usize] + (e & ((1 << 26) - 1));
+        for i in 0..npairs {
+            let a = dec(ends[2 * i].load(Ordering::Relaxed));
+            let b = dec(ends[2 * i + 1].load(Ordering::Relaxed));
+            let ra = find(&mut parent, a);
+            let rb = find(&mut parent, b);
+            if ra != rb {
+                if ra < rb {
+                    parent[rb as usize] = ra;
+                } else {
+                    parent[ra as usize] = rb;
                 }
             }
         }
@@ -1105,7 +1102,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // node keys in global index order
         let mut node_key: Vec<Key> = Vec::with_capacity(nnodes);
         for p in 0..LP {
-            node_key.extend_from_slice(&part_keys[p].1);
+            node_key.extend_from_slice(&part_keys[p]);
         }
         let mut root_min: Vec<Key> = vec![Key::default(); nnodes];
         let mut has_min = vec![false; nnodes];
@@ -1125,7 +1122,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let pk = &part_keys;
             let cells: Vec<Mutex<PSub>> = (0..LP).map(|_| Mutex::new(PSub::new(0))).collect();
             pool(lt, LP, || (), |_, p| {
-                let (_, keys) = &pk[p];
+                let keys = &pk[p];
                 let mut m = PSub::new(keys.len());
                 for (li, &k) in keys.iter().enumerate() {
                     let gi = offs[p] as usize + li;
@@ -1148,14 +1145,17 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- 4. parse events + clicks -------------------------------------------
     struct PState {
         ev: Vec<BlockVec<ERec>>,
-        ck: Vec<BlockVec<CRec>>,
     }
+    // Event-id buckets: ~20K events each keeps every dedup hash table cache-resident.
+    let ev_bytes: usize = ev_chunks.iter().map(|c| c.end - c.start).sum();
+    let ne = (ev_bytes / 85 / 20_000).next_power_of_two().clamp(1024, 8192);
+    let ne_mask = ne - 1;
     let (pmap, pstates) = std::thread::scope(|sc| {
         let h = sc.spawn(build_links);
         let pstates = pool(
             nt,
             ev_chunks.len(),
-            || PState { ev: (0..NE).map(|_| BlockVec::new()).collect(), ck: Vec::new() },
+            || PState { ev: (0..ne).map(|_| BlockVec::new()).collect() },
             |st, i| {
                 let c = ev_chunks[i];
                 let b = &maps[c.file][c.start..c.end];
@@ -1203,13 +1203,13 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             }
                         }
                     }
-                    st.ev[ebucket(khash(eid))].push(rec);
+                    st.ev[ebucket(khash(eid), ne_mask)].push(rec);
                 });
             },
         );
         (h.join().unwrap(), pstates)
     });
-    lg("events parsed");
+    lg(&format!("events parsed ({} event buckets)", ne));
     struct CState {
         ck: Vec<BlockVec<CRec>>,
         pend: Vec<(Key, u64, Key, i64, u32)>,
@@ -1258,7 +1258,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- 5. dedup events per event bucket -> person buckets -----------------
     let dstates = pool(
         nt,
-        NE,
+        ne,
         || ((0..NP).map(|_| BlockVec::<PRec>::new()).collect::<Vec<_>>(), kmap::<(i64, u32, u32)>(0)),
         |st, b| {
             let (out, table) = st;
