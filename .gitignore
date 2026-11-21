@@ -1,0 +1,25 @@
+# Virtual environments
+.venv*
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary and output directories
+out/
+dev/
+dev-answer/
+duckdb_tmp/
+scratch/
+*.parquet
+
+# Build artifacts
+target/
+*.o
+*.a
+
+# Logs
+*.log
