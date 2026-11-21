@@ -1940,4 +1940,84 @@ mod tests {
         }
         assert!(checked > 1_000_000);
     }
+
+    // Naive reference for the CSV dialect: split on '\n' and ',', each field either has no
+    // quotes or is wrapped in exactly one pair of quotes with none inside.
+    fn ref_lines<const N: usize>(buf: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        for line in buf.split(|&c| c == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&[u8]> = line.split(|&c| c == b',').collect();
+            if parts.len() != N {
+                continue;
+            }
+            let mut fields = Vec::new();
+            let mut ok = true;
+            for p in parts {
+                let nq = p.iter().filter(|&&c| c == b'"').count();
+                if nq == 0 {
+                    fields.push(p.to_vec());
+                } else if nq == 2 && p.len() >= 2 && p[0] == b'"' && p[p.len() - 1] == b'"' {
+                    fields.push(p[1..p.len() - 1].to_vec());
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                out.push(fields);
+            }
+        }
+        out
+    }
+
+    fn check_tokenizer<const N: usize>(seed: u64) {
+        let mut x = seed;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = b"abcdefgh01234,,,,,\"\" \r";
+        for _ in 0..3000 {
+            let mut buf = Vec::new();
+            for _ in 0..(rnd() % 12) {
+                let len = match rnd() % 4 {
+                    0 => (rnd() % 200) as usize, // includes > 128 (slow path)
+                    _ => (rnd() % 100) as usize,
+                };
+                let mut line: Vec<u8> = (0..len).map(|_| alphabet[(rnd() as usize) % alphabet.len()]).collect();
+                if rnd() % 3 == 0 {
+                    // a well-formed line, sometimes with quoted fields
+                    line = (0..N)
+                        .map(|_| {
+                            let v: Vec<u8> = (0..(rnd() % 12)).map(|_| b'a' + (rnd() % 26) as u8).collect();
+                            if rnd() % 5 == 0 { [&b"\""[..], &v, &b"\""[..]].concat() } else { v }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(&b',');
+                }
+                buf.extend_from_slice(&line);
+                buf.push(b'\n');
+            }
+            if rnd() % 2 == 0 {
+                buf.pop(); // last line without trailing newline
+            }
+            let mut got: Vec<Vec<Vec<u8>>> = Vec::new();
+            for_each_line::<N, _>(&buf, |f| got.push(f.iter().map(|x| x.to_vec()).collect()));
+            assert_eq!(got, ref_lines::<N>(&buf), "buf {:?}", String::from_utf8_lossy(&buf));
+        }
+    }
+
+    #[test]
+    fn tokenizer_matches_reference() {
+        for seed in 1..=20u64 {
+            check_tokenizer::<2>(seed * 7919);
+            check_tokenizer::<4>(seed * 104729);
+            check_tokenizer::<7>(seed * 1299709);
+        }
+    }
 }
