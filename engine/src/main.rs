@@ -1406,8 +1406,10 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     struct SState {
         rows: Vec<URow>,
         camp: Vec<[i64; 4]>, // [sessions, purchasing, revenue, assisted] per (camp, day)
-        stamp: Vec<u32>,
-        sess_ctr: u32,
+        // sliding click window: clicks per campaign, and campaigns with count > 0
+        wcnt: Vec<u32>,
+        active: Vec<u32>,
+        apos: Vec<u32>,
         catacc: Vec<(u16, i64)>,
         pidx: KMap<u32>,
         pkeys: Vec<Key>,
@@ -1425,8 +1427,9 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         || SState {
             rows: Vec::new(),
             camp: vec![[0i64; 4]; nci * ndays],
-            stamp: vec![0u32; nci],
-            sess_ctr: 0,
+            wcnt: vec![0u32; nci],
+            active: Vec::new(),
+            apos: vec![0u32; nci],
             catacc: Vec::new(),
             pidx: kmap(1024),
             pkeys: Vec::new(),
@@ -1612,14 +1615,34 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
 
                     // clicks window [start - 7d, start]; session starts are increasing
+                    // [lo, hi) is maintained incrementally, together with the set of campaigns
+                    // that have a click in it (each click enters and leaves exactly once).
                     let wlo = start - WEEK_MS;
                     while lo < pck.len() && (pck[lo].ts as i64) < wlo {
+                        if lo < hi {
+                            let c = pck[lo].camp as usize;
+                            st.wcnt[c] -= 1;
+                            if st.wcnt[c] == 0 {
+                                let p = st.apos[c] as usize;
+                                let last = st.active.pop().unwrap();
+                                if p < st.active.len() {
+                                    st.active[p] = last;
+                                    st.apos[last as usize] = p as u32;
+                                }
+                            }
+                        }
                         lo += 1;
                     }
                     if hi < lo {
                         hi = lo;
                     }
                     while hi < pck.len() && (pck[hi].ts as i64) <= start {
+                        let c = pck[hi].camp as usize;
+                        if st.wcnt[c] == 0 {
+                            st.apos[c] = st.active.len() as u32;
+                            st.active.push(c as u32);
+                        }
+                        st.wcnt[c] += 1;
                         hi += 1;
                     }
                     let di = (day - day0) as usize;
@@ -1634,26 +1657,21 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     } else {
                         organic
                     };
-                    let a = &mut st.camp[credited as usize * ndays + di];
+                    let row = di * nci;
+                    let a = &mut st.camp[row + credited as usize];
                     a[0] += 1;
                     a[1] += purch as i64;
                     a[2] += rev;
-                    if hi > lo {
-                        st.sess_ctr = st.sess_ctr.wrapping_add(1);
-                        if st.sess_ctr == 0 {
-                            st.stamp.iter_mut().for_each(|x| *x = 0);
-                            st.sess_ctr = 1;
-                        }
-                        let sc = st.sess_ctr;
-                        for c in &pck[lo..hi] {
-                            let ca = c.camp as usize;
-                            if st.stamp[ca] != sc {
-                                st.stamp[ca] = sc;
-                                st.camp[ca * ndays + di][3] += 1;
-                            }
-                        }
+                    // assists: every campaign with a click in the window, once
+                    for &c in &st.active {
+                        st.camp[row + c as usize][3] += 1;
                     }
                 }
+                // reset the window state for the next person
+                for &c in &st.active {
+                    st.wcnt[c as usize] = 0;
+                }
+                st.active.clear();
                 if cur_day != i64::MIN {
                     drow.top = top_cat(&st.catacc, &cat_rank);
                     st.rows.push(drow);
@@ -1702,7 +1720,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let (mut d, mut s0, mut s1, mut s2, mut s3) = (vec![], vec![], vec![], vec![], vec![]);
                 for c in 0..nci {
                     for di in 0..ndays {
-                        let a = agg[c * ndays + di];
+                        let a = agg[di * nci + c];
                         if a[0] == 0 && a[3] == 0 {
                             continue;
                         }
