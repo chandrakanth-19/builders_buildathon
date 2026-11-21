@@ -34,8 +34,10 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 // ---------------------------------------------------------------------------
 
 struct HugeAlloc;
-const BIG: usize = 256 << 10;
+const ARENA_MIN: usize = 16 << 10; // [ARENA_MIN, BIG): per-thread huge-page bump arenas
+const BIG: usize = 4 << 20; // >= BIG: dedicated mmap
 const HUGE: usize = 2 << 20;
+const ARENA_REGION: usize = 64 << 20;
 
 #[inline(always)]
 fn round_up(n: usize) -> usize {
@@ -61,36 +63,94 @@ unsafe fn big_map(size: usize) -> *mut u8 {
     p as *mut u8
 }
 
+thread_local! {
+    // (cursor, end) of this thread's current arena region
+    static ARENA: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[inline(always)]
+fn class(l: &std::alloc::Layout) -> u8 {
+    if l.align() > 4096 || l.size() < ARENA_MIN {
+        0
+    } else if l.size() < BIG {
+        1
+    } else {
+        2
+    }
+}
+
+unsafe fn arena_alloc(size: usize, align: usize) -> *mut u8 {
+    let align = align.max(64);
+    ARENA.with(|a| {
+        let (mut cur, mut end) = a.get();
+        let mut p = (cur + align - 1) & !(align - 1);
+        if cur == 0 || p + size > end {
+            let raw = big_map(ARENA_REGION + HUGE);
+            if raw.is_null() {
+                return std::ptr::null_mut();
+            }
+            let start = ((raw as usize) + HUGE - 1) & !(HUGE - 1);
+            cur = start;
+            end = raw as usize + ARENA_REGION + HUGE;
+            p = (cur + align - 1) & !(align - 1);
+        }
+        a.set((p + size, end));
+        p as *mut u8
+    })
+}
+
+/// Returns the block to the arena only if it is the most recent allocation.
+unsafe fn arena_free(p: *mut u8, size: usize) {
+    ARENA.with(|a| {
+        let (cur, end) = a.get();
+        if p as usize + size == cur {
+            a.set((p as usize, end));
+        }
+    })
+}
+
 unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     #[inline]
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
-        if l.size() >= BIG && l.align() <= 4096 {
-            big_map(l.size())
-        } else {
-            std::alloc::System.alloc(l)
+        match class(&l) {
+            0 => std::alloc::System.alloc(l),
+            1 => arena_alloc(l.size(), l.align()),
+            _ => big_map(l.size()),
         }
     }
     #[inline]
     unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
-        if l.size() >= BIG && l.align() <= 4096 {
-            big_map(l.size()) // fresh anonymous pages are zero
-        } else {
-            std::alloc::System.alloc_zeroed(l)
+        match class(&l) {
+            0 => std::alloc::System.alloc_zeroed(l),
+            1 => {
+                let p = arena_alloc(l.size(), l.align());
+                if !p.is_null() {
+                    // arena memory may be recycled from a rewound block
+                    std::ptr::write_bytes(p, 0, l.size());
+                }
+                p
+            }
+            _ => big_map(l.size()), // fresh anonymous pages are zero
         }
     }
     #[inline]
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
-        if l.size() >= BIG && l.align() <= 4096 {
-            libc::munmap(p as *mut libc::c_void, round_up(l.size()));
-        } else {
-            std::alloc::System.dealloc(p, l)
+        match class(&l) {
+            0 => std::alloc::System.dealloc(p, l),
+            1 => arena_free(p, l.size()),
+            _ => {
+                libc::munmap(p as *mut libc::c_void, round_up(l.size()));
+            }
         }
     }
     #[inline]
     unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        let old_big = l.size() >= BIG && l.align() <= 4096;
-        let new_big = new_size >= BIG && l.align() <= 4096;
-        if old_big && new_big {
+        let nl = std::alloc::Layout::from_size_align_unchecked(new_size, l.align());
+        let (co, cn) = (class(&l), class(&nl));
+        if co == 0 && cn == 0 {
+            return std::alloc::System.realloc(p, l, new_size);
+        }
+        if co == 2 && cn == 2 {
             let q = libc::mremap(
                 p as *mut libc::c_void,
                 round_up(l.size()),
@@ -100,15 +160,24 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
             if q == libc::MAP_FAILED {
                 return std::ptr::null_mut();
             }
-            if round_up(new_size) >= HUGE {
-                libc::madvise(q, round_up(new_size), libc::MADV_HUGEPAGE);
-            }
+            libc::madvise(q, round_up(new_size), libc::MADV_HUGEPAGE);
             return q as *mut u8;
         }
-        if !old_big && !new_big {
-            return std::alloc::System.realloc(p, l, new_size);
+        if co == 1 && cn == 1 {
+            // grow/shrink in place when this is the arena's most recent block
+            let grown = ARENA.with(|a| {
+                let (cur, end) = a.get();
+                if p as usize + l.size() == cur && p as usize + new_size <= end {
+                    a.set((p as usize + new_size, end));
+                    true
+                } else {
+                    false
+                }
+            });
+            if grown {
+                return p;
+            }
         }
-        let nl = std::alloc::Layout::from_size_align_unchecked(new_size, l.align());
         let q = self.alloc(nl);
         if !q.is_null() {
             std::ptr::copy_nonoverlapping(p, q, l.size().min(new_size));
@@ -351,35 +420,69 @@ impl PMap {
 
 /// Calls `f(fields)` for every well-formed line of `buf` with exactly N fields.
 /// Malformed lines (wrong field count, bad quotes, empty) are skipped.
+///
+/// Works per line from per-block bitmasks: comma positions come from the comma mask, and
+/// quoting is validated in closed form: every field that starts with '"' must end with '"'
+/// and be at least 2 bytes long, no field may end with '"' without starting with one, and the
+/// line's total quote count must equal 2 x (number of quoted fields), so no stray quotes remain.
 #[inline(always)]
 fn for_each_line<const N: usize, F: FnMut(&[&[u8]; N])>(buf: &[u8], mut f: F) {
-    let mut fields: [&[u8]; N] = [&[]; N];
+    let len = buf.len();
+    let mut commas = [0usize; N];
+    let mut ncomma = 0usize;
+    let mut qcount = 0u32;
     let mut line_start = 0usize;
-    let mut fstart = 0usize;
-    let mut fidx = 0usize;
-    let mut bad = false;
-    let mut qn = 0u32;
-    let mut q0 = 0usize;
-    let mut q1 = 0usize;
 
-    macro_rules! end_field {
-        ($e:expr) => {{
-            let e = $e;
-            if fidx >= N {
-                bad = true;
-            } else if qn == 0 {
-                fields[fidx] = &buf[fstart..e];
-            } else if qn == 2 && q0 == fstart && q1 + 1 == e && e - fstart >= 2 {
-                fields[fidx] = &buf[fstart + 1..e - 1];
-            } else {
-                bad = true;
+    #[inline(always)]
+    fn emit<const N: usize, F: FnMut(&[&[u8]; N])>(
+        buf: &[u8],
+        ls: usize,
+        le: usize,
+        commas: &[usize; N],
+        ncomma: usize,
+        qcount: u32,
+        f: &mut F,
+    ) {
+        if le == ls || ncomma != N - 1 {
+            return;
+        }
+        let mut fields: [&[u8]; N] = [&[]; N];
+        if qcount == 0 {
+            let mut s = ls;
+            for i in 0..N - 1 {
+                fields[i] = &buf[s..commas[i]];
+                s = commas[i] + 1;
             }
-            fidx += 1;
-            qn = 0;
-        }};
+            fields[N - 1] = &buf[s..le];
+            f(&fields);
+            return;
+        }
+        let mut quoted = 0u32;
+        let mut s = ls;
+        for i in 0..N {
+            let e = if i < N - 1 { commas[i] } else { le };
+            let fl = &buf[s..e];
+            let n = fl.len();
+            if n > 0 && fl[0] == b'"' {
+                if n < 2 || fl[n - 1] != b'"' {
+                    return;
+                }
+                fields[i] = &fl[1..n - 1];
+                quoted += 1;
+            } else {
+                if n > 0 && fl[n - 1] == b'"' {
+                    return;
+                }
+                fields[i] = fl;
+            }
+            s = e + 1;
+        }
+        if qcount != 2 * quoted {
+            return;
+        }
+        f(&fields);
     }
 
-    let len = buf.len();
     let mut base = 0usize;
     let mut tail = [0u8; 64];
     while base < len {
@@ -390,95 +493,67 @@ fn for_each_line<const N: usize, F: FnMut(&[&[u8]; N])>(buf: &[u8], mut f: F) {
             tail[..len - base].copy_from_slice(&buf[base..]);
             &tail
         };
-        let mut m = delim_mask(blk);
-        while m != 0 {
-            let p = base + m.trailing_zeros() as usize;
-            m &= m - 1;
-            match buf[p] {
-                b',' => {
-                    end_field!(p);
-                    fstart = p + 1;
+        let (mut cm, mut nm, mut qm) = delim_masks(blk);
+        loop {
+            let below = if nm != 0 { (nm & nm.wrapping_neg()) - 1 } else { !0u64 };
+            let mut cs = cm & below;
+            qcount += (qm & below).count_ones();
+            while cs != 0 {
+                if ncomma < N {
+                    commas[ncomma] = base + cs.trailing_zeros() as usize;
                 }
-                b'"' => {
-                    if qn == 0 {
-                        q0 = p;
-                    } else {
-                        q1 = p;
-                    }
-                    qn += 1;
-                }
-                _ => {
-                    // newline
-                    if p > line_start {
-                        end_field!(p);
-                        if !bad && fidx == N {
-                            f(&fields);
-                        }
-                    }
-                    line_start = p + 1;
-                    fstart = p + 1;
-                    fidx = 0;
-                    bad = false;
-                    qn = 0;
-                }
+                ncomma += 1;
+                cs &= cs - 1;
             }
+            if nm == 0 {
+                break;
+            }
+            let nl = base + nm.trailing_zeros() as usize;
+            emit::<N, F>(buf, line_start, nl, &commas, ncomma, qcount, &mut f);
+            line_start = nl + 1;
+            ncomma = 0;
+            qcount = 0;
+            let upto = below | (nm & nm.wrapping_neg());
+            cm &= !upto;
+            qm &= !upto;
+            nm &= nm - 1;
         }
         base += 64;
     }
-    if buf.len() > line_start {
-        end_field!(buf.len());
-        if !bad && fidx == N {
-            f(&fields);
-        }
+    if len > line_start {
+        emit::<N, F>(buf, line_start, len, &commas, ncomma, qcount, &mut f);
     }
 }
 
-/// Bitmask of positions in a 64-byte block holding ',', '\n' or '"'.
+/// Per-block masks of ',' / '\n' / '"' positions.
 #[inline(always)]
-fn delim_mask(b: &[u8; 64]) -> u64 {
-    #[cfg(target_arch = "x86_64")]
+fn delim_masks(b: &[u8; 64]) -> (u64, u64, u64) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     unsafe {
-        #[cfg(target_feature = "avx2")]
-        {
-            use std::arch::x86_64::*;
-            let c = _mm256_set1_epi8(b',' as i8);
-            let n = _mm256_set1_epi8(b'\n' as i8);
-            let q = _mm256_set1_epi8(b'"' as i8);
-            let mut out = 0u64;
-            for h in 0..2 {
-                let v = _mm256_loadu_si256(b.as_ptr().add(h * 32) as *const __m256i);
-                let x = _mm256_or_si256(
-                    _mm256_or_si256(_mm256_cmpeq_epi8(v, c), _mm256_cmpeq_epi8(v, n)),
-                    _mm256_cmpeq_epi8(v, q),
-                );
-                out |= (_mm256_movemask_epi8(x) as u32 as u64) << (h * 32);
-            }
-            return out;
-        }
-        #[cfg(not(target_feature = "avx2"))]
-        {
-            use std::arch::x86_64::*;
-            let c = _mm_set1_epi8(b',' as i8);
-            let n = _mm_set1_epi8(b'\n' as i8);
-            let q = _mm_set1_epi8(b'"' as i8);
-            let mut out = 0u64;
-            for h in 0..4 {
-                let v = _mm_loadu_si128(b.as_ptr().add(h * 16) as *const __m128i);
-                let x = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, c), _mm_cmpeq_epi8(v, n)), _mm_cmpeq_epi8(v, q));
-                out |= (_mm_movemask_epi8(x) as u32 as u64 & 0xFFFF) << (h * 16);
-            }
-            return out;
-        }
+        use std::arch::x86_64::*;
+        let c = _mm256_set1_epi8(b',' as i8);
+        let n = _mm256_set1_epi8(b'\n' as i8);
+        let q = _mm256_set1_epi8(b'"' as i8);
+        let v0 = _mm256_loadu_si256(b.as_ptr() as *const __m256i);
+        let v1 = _mm256_loadu_si256(b.as_ptr().add(32) as *const __m256i);
+        let mk = |x: __m256i, y: __m256i| -> u64 {
+            (_mm256_movemask_epi8(x) as u32 as u64) | ((_mm256_movemask_epi8(y) as u32 as u64) << 32)
+        };
+        return (
+            mk(_mm256_cmpeq_epi8(v0, c), _mm256_cmpeq_epi8(v1, c)),
+            mk(_mm256_cmpeq_epi8(v0, n), _mm256_cmpeq_epi8(v1, n)),
+            mk(_mm256_cmpeq_epi8(v0, q), _mm256_cmpeq_epi8(v1, q)),
+        );
     }
     #[allow(unreachable_code)]
     {
-        let mut out = 0u64;
+        let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
         for (i, &x) in b.iter().enumerate() {
-            if x == b',' || x == b'\n' || x == b'"' {
-                out |= 1 << i;
-            }
+            c |= ((x == b',') as u64) << i;
+            n |= ((x == b'\n') as u64) << i;
+            q |= ((x == b'"') as u64) << i;
         }
-        out
+        (c, n, q)
     }
 }
 
@@ -593,6 +668,60 @@ fn parse_price(s: &[u8]) -> Option<u32> {
         None
     }
 }
+
+// ---------------------------------------------------------------------------
+// BlockVec: append-only list of fixed 512-element blocks (no realloc copies, no slack
+// beyond one partial block). Blocks come from the huge-page arena allocator.
+// ---------------------------------------------------------------------------
+
+const BCAP: usize = 512;
+
+struct BlockVec<T: Copy> {
+    blocks: Vec<*mut T>,
+    len: usize,
+}
+unsafe impl<T: Copy + Send> Send for BlockVec<T> {}
+unsafe impl<T: Copy + Sync> Sync for BlockVec<T> {}
+
+impl<T: Copy> BlockVec<T> {
+    fn new() -> Self {
+        BlockVec { blocks: Vec::new(), len: 0 }
+    }
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.len
+    }
+    #[inline(always)]
+    fn push(&mut self, v: T) {
+        let off = self.len % BCAP;
+        if off == 0 {
+            let l = std::alloc::Layout::array::<T>(BCAP).unwrap().align_to(64).unwrap();
+            let p = unsafe { std::alloc::alloc(l) } as *mut T;
+            if p.is_null() {
+                std::alloc::handle_alloc_error(l);
+            }
+            self.blocks.push(p);
+        }
+        unsafe { self.blocks.last().unwrap_unchecked().add(off).write(v) };
+        self.len += 1;
+    }
+    #[inline(always)]
+    fn block(&self, i: usize) -> &[T] {
+        let n = if i + 1 == self.blocks.len() { self.len - i * BCAP } else { BCAP };
+        unsafe { std::slice::from_raw_parts(self.blocks[i], n) }
+    }
+    fn iter(&self) -> impl Iterator<Item = &T> + '_ {
+        (0..self.blocks.len()).flat_map(move |i| self.block(i).iter())
+    }
+}
+impl<T: Copy> std::ops::Index<usize> for BlockVec<T> {
+    type Output = T;
+    #[inline(always)]
+    fn index(&self, i: usize) -> &T {
+        unsafe { &*self.blocks[i / BCAP].add(i % BCAP) }
+    }
+}
+// Blocks are intentionally never freed: the process exits right after writing output.
 
 // ---------------------------------------------------------------------------
 // Records
@@ -989,20 +1118,15 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // --- 4. parse events + clicks -------------------------------------------
     struct PState {
-        ev: Vec<Vec<ERec>>,
-        ck: Vec<Vec<CRec>>,
+        ev: Vec<BlockVec<ERec>>,
+        ck: Vec<BlockVec<CRec>>,
     }
-    let ev_bytes: usize = data_chunks.iter().filter(|c| c.0 == 1).map(|c| c.1.end - c.1.start).sum();
-    let ck_bytes: usize = data_chunks.iter().filter(|c| c.0 == 2).map(|c| c.1.end - c.1.start).sum();
-    // generous per-thread per-bucket reservations (untouched capacity costs nothing)
-    let ev_cap = ev_bytes / 70 / nt / NE * 3 / 2 + 16;
-    let ck_cap = ck_bytes / 50 / nt / NP * 3 / 2 + 16;
     let pstates = pool(
         nt,
         data_chunks.len(),
         || PState {
-            ev: (0..NE).map(|_| Vec::with_capacity(ev_cap)).collect(),
-            ck: (0..NP).map(|_| Vec::with_capacity(ck_cap)).collect(),
+            ev: (0..NE).map(|_| BlockVec::new()).collect(),
+            ck: (0..NP).map(|_| BlockVec::new()).collect(),
         },
         |st, i| {
             let (kind, c) = data_chunks[i];
@@ -1080,12 +1204,10 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lg("parse done");
 
     // --- 5. dedup events per event bucket -> person buckets -----------------
-    let n_ev: usize = pstates.iter().map(|s| s.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
-    let pr_cap = n_ev / nt / NP * 3 / 2 + 16;
     let dstates = pool(
         nt,
         NE,
-        || ((0..NP).map(|_| Vec::<PRec>::with_capacity(pr_cap)).collect::<Vec<_>>(), kmap::<(i64, u32, u32)>(0)),
+        || ((0..NP).map(|_| BlockVec::<PRec>::new()).collect::<Vec<_>>(), kmap::<(i64, u32, u32)>(0)),
         |st, b| {
             let (out, table) = st;
             table.clear();
@@ -1143,14 +1265,33 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lg("dedup done");
 
     // --- 6. sessionize per person bucket ------------------------------------
+    #[derive(Clone, Copy, Default)]
+    struct SEv {
+        ts: i64,
+        price: u32,
+        cat: u16,
+        flags: u8,
+    }
+    #[derive(Clone, Copy, Default)]
+    struct SClk {
+        ts: i64,
+        click: Key,
+        camp: u32,
+    }
     struct SState {
         rows: Vec<URow>,
         camp: Vec<[i64; 4]>, // [sessions, purchasing, revenue, assisted] per (camp, day)
         stamp: Vec<u32>,
         sess_ctr: u32,
-        ev: Vec<PRec>,
-        ck: Vec<CRec>,
         catacc: Vec<(u16, i64)>,
+        pidx: KMap<u32>,
+        pkeys: Vec<Key>,
+        evp: Vec<u32>,
+        eoff: Vec<u32>,
+        coff: Vec<u32>,
+        sev: Vec<SEv>,
+        sck: Vec<SClk>,
+        ckp: Vec<u32>,
     }
     let nci = ncamp + 1;
     let sstates = pool(
@@ -1161,48 +1302,129 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             camp: vec![[0i64; 4]; nci * ndays],
             stamp: vec![0u32; nci],
             sess_ctr: 0,
-            ev: Vec::new(),
-            ck: Vec::new(),
             catacc: Vec::new(),
+            pidx: kmap(1024),
+            pkeys: Vec::new(),
+            evp: Vec::new(),
+            eoff: Vec::new(),
+            coff: Vec::new(),
+            sev: Vec::new(),
+            sck: Vec::new(),
+            ckp: Vec::new(),
         },
         |st, b| {
-            let mut ev = std::mem::take(&mut st.ev);
-            let mut ck = std::mem::take(&mut st.ck);
-            ev.clear();
-            ck.clear();
+            // dense person index for this bucket + counting sort of events by person
+            st.pidx.clear();
+            st.pkeys.clear();
+            st.evp.clear();
+            st.eoff.clear();
             for d in &dstates {
-                ev.extend_from_slice(&d.0[b]);
+                for r in d.0[b].iter() {
+                    let next = st.pkeys.len() as u32;
+                    let id = *st.pidx.entry(r.person).or_insert(next);
+                    if id == next {
+                        st.pkeys.push(r.person);
+                        st.eoff.push(0);
+                    }
+                    st.eoff[id as usize] += 1;
+                    st.evp.push(id);
+                }
             }
+            let np = st.pkeys.len();
+            let mut acc = 0u32;
+            for x in st.eoff.iter_mut() {
+                let c = *x;
+                *x = acc;
+                acc += c;
+            }
+            st.eoff.push(acc);
+            st.sev.clear();
+            st.sev.resize(acc as usize, SEv::default());
+            {
+                let mut k = 0usize;
+                for d in &dstates {
+                    for r in d.0[b].iter() {
+                        let id = st.evp[k] as usize;
+                        k += 1;
+                        let pos = st.eoff[id] as usize;
+                        st.eoff[id] += 1;
+                        st.sev[pos] = SEv { ts: r.ts, price: r.price, cat: r.cat, flags: r.flags };
+                    }
+                }
+            }
+            // eoff[id] now holds the end of id's range; shift back to starts
+            for id in (1..=np).rev() {
+                st.eoff[id] = st.eoff[id - 1];
+            }
+            st.eoff[0] = 0;
+
+            // clicks: only for persons with events
+            st.coff.clear();
+            st.coff.resize(np + 1, 0);
+            st.ckp.clear();
             for s in &pstates {
-                ck.extend_from_slice(&s.ck[b]);
+                for c in s.ck[b].iter() {
+                    let id = match st.pidx.get(&c.person) {
+                        Some(&id) => id,
+                        None => u32::MAX,
+                    };
+                    if id != u32::MAX {
+                        st.coff[id as usize] += 1;
+                    }
+                    st.ckp.push(id);
+                }
             }
-            ev.sort_unstable_by(|a, b| (a.person, a.ts).cmp(&(b.person, b.ts)));
-            ck.sort_unstable_by(|a, b| {
-                (a.person, a.ts)
-                    .cmp(&(b.person, b.ts))
-                    .then_with(|| key_cmp(a.click, b.click))
-            });
-            ck.dedup_by(|a, b| a.person == b.person && a.click == b.click);
+            let mut acc = 0u32;
+            for x in st.coff.iter_mut() {
+                let c = *x;
+                *x = acc;
+                acc += c;
+            }
+            st.sck.clear();
+            st.sck.resize(acc as usize, SClk::default());
+            {
+                let mut k = 0usize;
+                for s in &pstates {
+                    for c in s.ck[b].iter() {
+                        let id = st.ckp[k];
+                        k += 1;
+                        if id == u32::MAX {
+                            continue;
+                        }
+                        let pos = st.coff[id as usize] as usize;
+                        st.coff[id as usize] += 1;
+                        st.sck[pos] = SClk { ts: c.ts, click: c.click, camp: c.camp };
+                    }
+                }
+            }
+            for id in (1..=np).rev() {
+                st.coff[id] = st.coff[id - 1];
+            }
+            st.coff[0] = 0;
 
-            let mut ci = 0usize;
-            let mut i = 0usize;
-            let n = ev.len();
-            while i < n {
-                let person = ev[i].person;
-                let ps = i;
-                while i < n && ev[i].person == person {
-                    i += 1;
+            let mut sev = std::mem::take(&mut st.sev);
+            let mut sck = std::mem::take(&mut st.sck);
+            for pid in 0..np {
+                let person = st.pkeys[pid];
+                let pev_m = &mut sev[st.eoff[pid] as usize..st.eoff[pid + 1] as usize];
+                if pev_m.len() > 1 {
+                    pev_m.sort_unstable_by_key(|e| e.ts);
                 }
-                let pev = &ev[ps..i];
-                while ci < ck.len() && ck[ci].person < person {
-                    ci += 1;
+                let pck_full = &mut sck[st.coff[pid] as usize..st.coff[pid + 1] as usize];
+                if pck_full.len() > 1 {
+                    pck_full.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| key_cmp(a.click, b.click)));
                 }
-                let cs = ci;
-                while ci < ck.len() && ck[ci].person == person {
-                    ci += 1;
+                // dedup identical click ids (copies have identical ts, so they are adjacent)
+                let mut w = 0usize;
+                for r in 0..pck_full.len() {
+                    if w > 0 && pck_full[w - 1].click == pck_full[r].click && pck_full[w - 1].ts == pck_full[r].ts {
+                        continue;
+                    }
+                    pck_full[w] = pck_full[r];
+                    w += 1;
                 }
-                let pck = &ck[cs..ci];
-
+                let pck = &pck_full[..w];
+                let pev: &[SEv] = &sev[st.eoff[pid] as usize..st.eoff[pid + 1] as usize];
                 let mut cur_day: i64 = i64::MIN;
                 let mut drow = URow {
                     person,
@@ -1309,8 +1531,8 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     st.rows.push(drow);
                 }
             }
-            st.ev = ev;
-            st.ck = ck;
+            st.sev = sev;
+            st.sck = sck;
         },
     );
     lg("sessionize done");
