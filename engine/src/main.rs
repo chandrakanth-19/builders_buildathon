@@ -269,6 +269,29 @@ fn key_of(b: &[u8]) -> Key {
     }
 }
 
+/// Same as `key_of`, using one unaligned 16-byte load when `end` (one past the last readable
+/// byte of the underlying buffer) leaves room for it.
+#[inline(always)]
+fn key_fast(f: &[u8], end: usize) -> Key {
+    let n = f.len();
+    if n > 15 || (f.as_ptr() as usize) + 16 > end {
+        return key_of(f);
+    }
+    let raw = unsafe { std::ptr::read_unaligned(f.as_ptr() as *const [u8; 16]) };
+    let hi = u64::from_be_bytes(raw[0..8].try_into().unwrap());
+    let lo = u64::from_be_bytes(raw[8..16].try_into().unwrap());
+    let (hi, lo) = if n > 8 {
+        (hi, lo & (!0u64 << (8 * (16 - n))))
+    } else if n == 8 {
+        (hi, 0)
+    } else if n == 0 {
+        (0, 0)
+    } else {
+        (hi & (!0u64 << (8 * (8 - n))), 0)
+    };
+    Key { hi, lo: lo | n as u64 }
+}
+
 fn key_bytes(k: Key) -> Vec<u8> {
     if k.is_long() {
         let t = long_table().lock().unwrap();
@@ -991,147 +1014,152 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         data_chunks.len()
     ));
 
-    // --- 3. links -> person names -------------------------------------------
+    // --- 3. links -> person names (runs concurrently with event parsing) ----
     const LP: usize = 64;
     let lpart = |h: u64| ((h >> 40) as usize) & (LP - 1);
+    let lt = 2usize.min(nt);
+    let build_links = || -> PMap {
+        // --- 3. links -> person names -------------------------------------------
 
-    // parse pairs; also scatter endpoint keys by partition
-    let link_states = pool(
-        nt,
-        link_chunks.len(),
-        || (Vec::<(Key, Key)>::new(), (0..LP).map(|_| Vec::<Key>::new()).collect::<Vec<_>>()),
-        |st, i| {
-            let c = link_chunks[i];
-            let b = &maps[c.file][c.start..c.end];
-            for_each_line::<2, _>(b, |f| {
-                if f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                let a = key_of(f[0]);
-                let bk = key_of(f[1]);
-                st.0.push((a, bk));
-                st.1[lpart(khash(a))].push(a);
-                st.1[lpart(khash(bk))].push(bk);
-            });
-        },
-    );
-
-    // per partition: unique keys -> local index
-    let part_keys: Vec<Mutex<(KMap<u32>, Vec<Key>)>> = (0..LP).map(|_| Mutex::new((kmap(0), Vec::new()))).collect();
-    pool(nt, LP, || (), |_, p| {
-        let total: usize = link_states.iter().map(|s| s.1[p].len()).sum();
-        let mut m: KMap<u32> = kmap(total / 2 + 16);
-        let mut keys = Vec::new();
-        for s in &link_states {
-            for &k in &s.1[p] {
-                m.entry(k).or_insert_with(|| {
-                    keys.push(k);
-                    (keys.len() - 1) as u32
+        // parse pairs; also scatter endpoint keys by partition
+        let link_states = pool(
+            lt,
+            link_chunks.len(),
+            || (Vec::<(Key, Key)>::new(), (0..LP).map(|_| Vec::<Key>::new()).collect::<Vec<_>>()),
+            |st, i| {
+                let c = link_chunks[i];
+                let b = &maps[c.file][c.start..c.end];
+                for_each_line::<2, _>(b, |f| {
+                    if f[0].is_empty() || f[1].is_empty() {
+                        return;
+                    }
+                    let a = key_of(f[0]);
+                    let bk = key_of(f[1]);
+                    st.0.push((a, bk));
+                    st.1[lpart(khash(a))].push(a);
+                    st.1[lpart(khash(bk))].push(bk);
                 });
-            }
-        }
-        *part_keys[p].lock().unwrap() = (m, keys);
-    });
-    let mut part_keys: Vec<(KMap<u32>, Vec<Key>)> = part_keys.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    let mut offs = vec![0u32; LP + 1];
-    for p in 0..LP {
-        offs[p + 1] = offs[p] + part_keys[p].1.len() as u32;
-    }
-    let nnodes = offs[LP] as usize;
-    let gidx = |pk: &Vec<(KMap<u32>, Vec<Key>)>, k: Key| -> u32 {
-        let p = lpart(khash(k));
-        offs[p] + pk[p].0[&k]
-    };
+            },
+        );
 
-    // union-find
-    let mut parent: Vec<u32> = (0..nnodes as u32).collect();
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let g = parent[parent[x as usize] as usize];
-            parent[x as usize] = g;
-            x = g;
+        // per partition: unique keys -> local index
+        let part_keys: Vec<Mutex<(KMap<u32>, Vec<Key>)>> = (0..LP).map(|_| Mutex::new((kmap(0), Vec::new()))).collect();
+        pool(lt, LP, || (), |_, p| {
+            let total: usize = link_states.iter().map(|s| s.1[p].len()).sum();
+            let mut m: KMap<u32> = kmap(total / 2 + 16);
+            let mut keys = Vec::new();
+            for s in &link_states {
+                for &k in &s.1[p] {
+                    m.entry(k).or_insert_with(|| {
+                        keys.push(k);
+                        (keys.len() - 1) as u32
+                    });
+                }
+            }
+            *part_keys[p].lock().unwrap() = (m, keys);
+        });
+        let mut part_keys: Vec<(KMap<u32>, Vec<Key>)> = part_keys.into_iter().map(|m| m.into_inner().unwrap()).collect();
+        let mut offs = vec![0u32; LP + 1];
+        for p in 0..LP {
+            offs[p + 1] = offs[p] + part_keys[p].1.len() as u32;
         }
-        x
-    }
-    {
-        let pk = &part_keys;
-        let idx_pairs: Vec<Vec<(u32, u32)>> = pool(nt, link_states.len(), Vec::new, |v: &mut Vec<Vec<(u32, u32)>>, i| {
-            v.push(link_states[i].0.iter().map(|&(a, b)| (gidx(pk, a), gidx(pk, b))).collect());
-        })
-        .into_iter()
-        .flatten()
-        .collect();
-        for v in &idx_pairs {
-            for &(a, b) in v {
-                let ra = find(&mut parent, a);
-                let rb = find(&mut parent, b);
-                if ra != rb {
-                    if ra < rb {
-                        parent[rb as usize] = ra;
-                    } else {
-                        parent[ra as usize] = rb;
+        let nnodes = offs[LP] as usize;
+        let gidx = |pk: &Vec<(KMap<u32>, Vec<Key>)>, k: Key| -> u32 {
+            let p = lpart(khash(k));
+            offs[p] + pk[p].0[&k]
+        };
+
+        // union-find
+        let mut parent: Vec<u32> = (0..nnodes as u32).collect();
+        fn find(parent: &mut [u32], mut x: u32) -> u32 {
+            while parent[x as usize] != x {
+                let g = parent[parent[x as usize] as usize];
+                parent[x as usize] = g;
+                x = g;
+            }
+            x
+        }
+        {
+            let pk = &part_keys;
+            let idx_pairs: Vec<Vec<(u32, u32)>> = pool(lt, link_states.len(), Vec::new, |v: &mut Vec<Vec<(u32, u32)>>, i| {
+                v.push(link_states[i].0.iter().map(|&(a, b)| (gidx(pk, a), gidx(pk, b))).collect());
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+            for v in &idx_pairs {
+                for &(a, b) in v {
+                    let ra = find(&mut parent, a);
+                    let rb = find(&mut parent, b);
+                    if ra != rb {
+                        if ra < rb {
+                            parent[rb as usize] = ra;
+                        } else {
+                            parent[ra as usize] = rb;
+                        }
                     }
                 }
             }
         }
-    }
-    drop(link_states);
-    // node keys in global index order
-    let mut node_key: Vec<Key> = Vec::with_capacity(nnodes);
-    for p in 0..LP {
-        node_key.extend_from_slice(&part_keys[p].1);
-    }
-    let mut root_min: Vec<Key> = vec![Key::default(); nnodes];
-    let mut has_min = vec![false; nnodes];
-    let mut roots: Vec<u32> = vec![0; nnodes];
-    for i in 0..nnodes {
-        let r = find(&mut parent, i as u32);
-        roots[i] = r;
-        let k = node_key[i];
-        let r = r as usize;
-        if !has_min[r] || key_cmp(k, root_min[r]) == std::cmp::Ordering::Less {
-            root_min[r] = k;
-            has_min[r] = true;
+        drop(link_states);
+        // node keys in global index order
+        let mut node_key: Vec<Key> = Vec::with_capacity(nnodes);
+        for p in 0..LP {
+            node_key.extend_from_slice(&part_keys[p].1);
         }
-    }
-    // person map: user key -> person key (only for linked IDs whose name differs)
-    let pmap: PMap = {
-        let pk = &part_keys;
-        let cells: Vec<Mutex<PSub>> = (0..LP).map(|_| Mutex::new(PSub::new(0))).collect();
-        pool(nt, LP, || (), |_, p| {
-            let (_, keys) = &pk[p];
-            let mut m = PSub::new(keys.len());
-            for (li, &k) in keys.iter().enumerate() {
-                let gi = offs[p] as usize + li;
-                let name = root_min[roots[gi] as usize];
-                if name != k {
-                    m.insert(k, khash(k), name);
-                }
+        let mut root_min: Vec<Key> = vec![Key::default(); nnodes];
+        let mut has_min = vec![false; nnodes];
+        let mut roots: Vec<u32> = vec![0; nnodes];
+        for i in 0..nnodes {
+            let r = find(&mut parent, i as u32);
+            roots[i] = r;
+            let k = node_key[i];
+            let r = r as usize;
+            if !has_min[r] || key_cmp(k, root_min[r]) == std::cmp::Ordering::Less {
+                root_min[r] = k;
+                has_min[r] = true;
             }
-            *cells[p].lock().unwrap() = m;
-        });
-        PMap { parts: cells.into_iter().map(|c| c.into_inner().unwrap()).collect() }
+        }
+        // person map: user key -> person key (only for linked IDs whose name differs)
+        let pmap: PMap = {
+            let pk = &part_keys;
+            let cells: Vec<Mutex<PSub>> = (0..LP).map(|_| Mutex::new(PSub::new(0))).collect();
+            pool(lt, LP, || (), |_, p| {
+                let (_, keys) = &pk[p];
+                let mut m = PSub::new(keys.len());
+                for (li, &k) in keys.iter().enumerate() {
+                    let gi = offs[p] as usize + li;
+                    let name = root_min[roots[gi] as usize];
+                    if name != k {
+                        m.insert(k, khash(k), name);
+                    }
+                }
+                *cells[p].lock().unwrap() = m;
+            });
+            PMap { parts: cells.into_iter().map(|c| c.into_inner().unwrap()).collect() }
+        };
+        part_keys.clear();
+        lg(&format!("links done: {} ids", nnodes));
+        pmap
     };
-    part_keys.clear();
-    let person_of = |u: Key| -> Key { pmap.get(u, khash(u)) };
-    lg(&format!("links done: {} ids", nnodes));
+    let ev_chunks: Vec<Chunk> = data_chunks.iter().filter(|c| c.0 == 1).map(|c| c.1).collect();
+    let ck_chunks: Vec<Chunk> = data_chunks.iter().filter(|c| c.0 == 2).map(|c| c.1).collect();
 
     // --- 4. parse events + clicks -------------------------------------------
     struct PState {
         ev: Vec<BlockVec<ERec>>,
         ck: Vec<BlockVec<CRec>>,
     }
-    let pstates = pool(
-        nt,
-        data_chunks.len(),
-        || PState {
-            ev: (0..NE).map(|_| BlockVec::new()).collect(),
-            ck: (0..NP).map(|_| BlockVec::new()).collect(),
-        },
-        |st, i| {
-            let (kind, c) = data_chunks[i];
-            let b = &maps[c.file][c.start..c.end];
-            if kind == 1 {
+    let (pmap, pstates) = std::thread::scope(|sc| {
+        let h = sc.spawn(build_links);
+        let pstates = pool(
+            nt,
+            ev_chunks.len(),
+            || PState { ev: (0..NE).map(|_| BlockVec::new()).collect(), ck: Vec::new() },
+            |st, i| {
+                let c = ev_chunks[i];
+                let b = &maps[c.file][c.start..c.end];
+                let end = b.as_ptr() as usize + b.len();
                 for_each_line::<7, _>(b, |f| {
                     if f[0].is_empty() {
                         return;
@@ -1140,7 +1168,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         Some(v) => v,
                         None => return,
                     };
-                    let eid = key_of(f[0]);
+                    let eid = key_fast(f[0], end);
                     let mut rec = ERec {
                         eid,
                         user: Key::default(),
@@ -1161,7 +1189,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     match parse_price(f[6]) {
                                         Some(p) => {
                                             rec.price = p;
-                                            rec.cat = product_cat.get(&key_of(f[5])).copied().unwrap_or(0);
+                                            rec.cat = product_cat.get(&key_fast(f[5], end)).copied().unwrap_or(0);
                                             rec.flags |= F_PURCHASE;
                                         }
                                         None => valid = false,
@@ -1170,35 +1198,59 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 if valid {
                                     rec.flags |= F_VALID;
                                     rec.ts = ts;
-                                    rec.user = key_of(f[1]);
+                                    rec.user = key_fast(f[1], end);
                                 }
                             }
                         }
                     }
                     st.ev[ebucket(khash(eid))].push(rec);
                 });
-            } else {
-                for_each_line::<4, _>(b, |f| {
-                    if f[0].is_empty() || f[1].is_empty() {
-                        return;
-                    }
-                    let camp = match camp_idx.get(&key_of(f[2])) {
-                        Some(&c) => c,
-                        None => return,
-                    };
-                    let ts = match parse_ts(f[3]) {
-                        Some(t) if t >= click_start && t < win_end => t,
-                        _ => return,
-                    };
-                    let person = person_of(key_of(f[1]));
-                    st.ck[pbucket(khash(person))].push(CRec {
-                        person,
-                        click: key_of(f[0]),
-                        ts,
-                        camp,
-                    });
-                });
-            }
+            },
+        );
+        (h.join().unwrap(), pstates)
+    });
+    lg("events parsed");
+    struct CState {
+        ck: Vec<BlockVec<CRec>>,
+        pend: Vec<(Key, u64, Key, i64, u32)>,
+    }
+    #[inline(always)]
+    fn flush_clicks(st: &mut CState, pmap: &PMap) {
+        for &(user, h, click, ts, camp) in &st.pend {
+            let person = pmap.get(user, h);
+            st.ck[pbucket(khash(person))].push(CRec { person, click, ts, camp });
+        }
+        st.pend.clear();
+    }
+    let cstates = pool(
+        nt,
+        ck_chunks.len(),
+        || CState { ck: (0..NP).map(|_| BlockVec::new()).collect(), pend: Vec::with_capacity(32) },
+        |st, i| {
+            let c = ck_chunks[i];
+            let b = &maps[c.file][c.start..c.end];
+            let end = b.as_ptr() as usize + b.len();
+            for_each_line::<4, _>(b, |f| {
+                if f[0].is_empty() || f[1].is_empty() {
+                    return;
+                }
+                let camp = match camp_idx.get(&key_fast(f[2], end)) {
+                    Some(&c) => c,
+                    None => return,
+                };
+                let ts = match parse_ts(f[3]) {
+                    Some(t) if t >= click_start && t < win_end => t,
+                    _ => return,
+                };
+                let user = key_fast(f[1], end);
+                let h = khash(user);
+                pmap.prefetch(h);
+                st.pend.push((user, h, key_fast(f[0], end), ts, camp));
+                if st.pend.len() == 32 {
+                    flush_clicks(st, &pmap);
+                }
+            });
+            flush_clicks(st, &pmap);
         },
     );
     lg("parse done");
@@ -1362,7 +1414,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             st.coff.clear();
             st.coff.resize(np + 1, 0);
             st.ckp.clear();
-            for s in &pstates {
+            for s in &cstates {
                 for c in s.ck[b].iter() {
                     let id = match st.pidx.get(&c.person) {
                         Some(&id) => id,
@@ -1384,7 +1436,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             st.sck.resize(acc as usize, SClk::default());
             {
                 let mut k = 0usize;
-                for s in &pstates {
+                for s in &cstates {
                     for c in s.ck[b].iter() {
                         let id = st.ckp[k];
                         k += 1;
