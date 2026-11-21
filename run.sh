@@ -1,8 +1,14 @@
 #!/bin/sh
-# Entry point. Runs with no arguments; exit 0 means "done, check my output".
 set -eu
 : "${DATA_DIR:=/data}" "${OUTPUT_DIR:=/output}" "${SCRATCH_DIR:=/scratch}"
 export DATA_DIR OUTPUT_DIR SCRATCH_DIR
-# Read-only root filesystem: everything that wants a temp or home dir gets /scratch.
 export TMPDIR="$SCRATCH_DIR" HOME="$SCRATCH_DIR"
-exec python3 /app/pipeline/pipeline.py
+
+# Prefer compiled binary if available
+if [ -f /app/engine ]; then
+    exec /app/engine "$DATA_DIR" "$OUTPUT_DIR"
+elif [ -f "$(dirname "$0")/engine/target/release/engine" ]; then
+    exec "$(dirname "$0")/engine/target/release/engine" "$DATA_DIR" "$OUTPUT_DIR"
+else
+    exec python3 "$(dirname "$0")/pipeline/pipeline.py"
+fi
