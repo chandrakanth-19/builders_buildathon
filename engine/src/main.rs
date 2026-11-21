@@ -28,6 +28,99 @@ use memmap2::Mmap;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
+// ---------------------------------------------------------------------------
+// Allocator: large blocks straight from mmap with transparent huge pages,
+// grown in place with mremap; small blocks from the system allocator.
+// ---------------------------------------------------------------------------
+
+struct HugeAlloc;
+const BIG: usize = 256 << 10;
+const HUGE: usize = 2 << 20;
+
+#[inline(always)]
+fn round_up(n: usize) -> usize {
+    (n + 4095) & !4095
+}
+
+unsafe fn big_map(size: usize) -> *mut u8 {
+    let len = round_up(size);
+    let p = libc::mmap(
+        std::ptr::null_mut(),
+        len,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+        -1,
+        0,
+    );
+    if p == libc::MAP_FAILED {
+        return std::ptr::null_mut();
+    }
+    if len >= HUGE {
+        libc::madvise(p, len, libc::MADV_HUGEPAGE);
+    }
+    p as *mut u8
+}
+
+unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
+    #[inline]
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() >= BIG && l.align() <= 4096 {
+            big_map(l.size())
+        } else {
+            std::alloc::System.alloc(l)
+        }
+    }
+    #[inline]
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() >= BIG && l.align() <= 4096 {
+            big_map(l.size()) // fresh anonymous pages are zero
+        } else {
+            std::alloc::System.alloc_zeroed(l)
+        }
+    }
+    #[inline]
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if l.size() >= BIG && l.align() <= 4096 {
+            libc::munmap(p as *mut libc::c_void, round_up(l.size()));
+        } else {
+            std::alloc::System.dealloc(p, l)
+        }
+    }
+    #[inline]
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let old_big = l.size() >= BIG && l.align() <= 4096;
+        let new_big = new_size >= BIG && l.align() <= 4096;
+        if old_big && new_big {
+            let q = libc::mremap(
+                p as *mut libc::c_void,
+                round_up(l.size()),
+                round_up(new_size),
+                libc::MREMAP_MAYMOVE,
+            );
+            if q == libc::MAP_FAILED {
+                return std::ptr::null_mut();
+            }
+            if round_up(new_size) >= HUGE {
+                libc::madvise(q, round_up(new_size), libc::MADV_HUGEPAGE);
+            }
+            return q as *mut u8;
+        }
+        if !old_big && !new_big {
+            return std::alloc::System.realloc(p, l, new_size);
+        }
+        let nl = std::alloc::Layout::from_size_align_unchecked(new_size, l.align());
+        let q = self.alloc(nl);
+        if !q.is_null() {
+            std::ptr::copy_nonoverlapping(p, q, l.size().min(new_size));
+            self.dealloc(p, l);
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static GLOBAL: HugeAlloc = HugeAlloc;
+
 const DAY_MS: i64 = 86_400_000;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const GAP_MS: i64 = 1_800_000;
@@ -196,6 +289,62 @@ fn kmap<V>(cap: usize) -> KMap<V> {
     HashMap::with_capacity_and_hasher(cap, Default::default())
 }
 
+// Flat open-addressing map Key -> Key, partitioned; misses return the key itself.
+struct PSub {
+    slots: Vec<(Key, Key)>,
+    mask: usize,
+}
+impl PSub {
+    fn new(n: usize) -> Self {
+        let cap = (n * 2).next_power_of_two().max(16);
+        PSub { slots: vec![(Key::default(), Key::default()); cap], mask: cap - 1 }
+    }
+    fn insert(&mut self, k: Key, h: u64, v: Key) {
+        let mut i = (h as usize) & self.mask;
+        loop {
+            let s = &mut self.slots[i];
+            if s.0 == Key::default() || s.0 == k {
+                *s = (k, v);
+                return;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+struct PMap {
+    parts: Vec<PSub>,
+}
+impl PMap {
+    #[inline(always)]
+    fn part(&self, h: u64) -> &PSub {
+        &self.parts[((h >> 40) as usize) & (self.parts.len() - 1)]
+    }
+    #[inline(always)]
+    fn prefetch(&self, h: u64) {
+        let p = self.part(h);
+        let ptr = unsafe { p.slots.as_ptr().add((h as usize) & p.mask) };
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
+    fn get(&self, k: Key, h: u64) -> Key {
+        let p = self.part(h);
+        let mut i = (h as usize) & p.mask;
+        loop {
+            let s = &p.slots[i];
+            if s.0 == k {
+                return s.1;
+            }
+            if s.0 == Key::default() {
+                return k;
+            }
+            i = (i + 1) & p.mask;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CSV tokenizer: iterates lines of a chunk, yielding exactly-N unquoted fields.
 // ---------------------------------------------------------------------------
@@ -230,41 +379,106 @@ fn for_each_line<const N: usize, F: FnMut(&[&[u8]; N])>(buf: &[u8], mut f: F) {
         }};
     }
 
-    for p in memchr::memchr3_iter(b',', b'\n', b'"', buf) {
-        match buf[p] {
-            b',' => {
-                end_field!(p);
-                fstart = p + 1;
-            }
-            b'"' => {
-                if qn == 0 {
-                    q0 = p;
-                } else {
-                    q1 = p;
-                }
-                qn += 1;
-            }
-            _ => {
-                // newline
-                if p > line_start {
+    let len = buf.len();
+    let mut base = 0usize;
+    let mut tail = [0u8; 64];
+    while base < len {
+        let blk: &[u8; 64] = if base + 64 <= len {
+            buf[base..base + 64].try_into().unwrap()
+        } else {
+            tail = [0u8; 64];
+            tail[..len - base].copy_from_slice(&buf[base..]);
+            &tail
+        };
+        let mut m = delim_mask(blk);
+        while m != 0 {
+            let p = base + m.trailing_zeros() as usize;
+            m &= m - 1;
+            match buf[p] {
+                b',' => {
                     end_field!(p);
-                    if !bad && fidx == N {
-                        f(&fields);
-                    }
+                    fstart = p + 1;
                 }
-                line_start = p + 1;
-                fstart = p + 1;
-                fidx = 0;
-                bad = false;
-                qn = 0;
+                b'"' => {
+                    if qn == 0 {
+                        q0 = p;
+                    } else {
+                        q1 = p;
+                    }
+                    qn += 1;
+                }
+                _ => {
+                    // newline
+                    if p > line_start {
+                        end_field!(p);
+                        if !bad && fidx == N {
+                            f(&fields);
+                        }
+                    }
+                    line_start = p + 1;
+                    fstart = p + 1;
+                    fidx = 0;
+                    bad = false;
+                    qn = 0;
+                }
             }
         }
+        base += 64;
     }
     if buf.len() > line_start {
         end_field!(buf.len());
         if !bad && fidx == N {
             f(&fields);
         }
+    }
+}
+
+/// Bitmask of positions in a 64-byte block holding ',', '\n' or '"'.
+#[inline(always)]
+fn delim_mask(b: &[u8; 64]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        #[cfg(target_feature = "avx2")]
+        {
+            use std::arch::x86_64::*;
+            let c = _mm256_set1_epi8(b',' as i8);
+            let n = _mm256_set1_epi8(b'\n' as i8);
+            let q = _mm256_set1_epi8(b'"' as i8);
+            let mut out = 0u64;
+            for h in 0..2 {
+                let v = _mm256_loadu_si256(b.as_ptr().add(h * 32) as *const __m256i);
+                let x = _mm256_or_si256(
+                    _mm256_or_si256(_mm256_cmpeq_epi8(v, c), _mm256_cmpeq_epi8(v, n)),
+                    _mm256_cmpeq_epi8(v, q),
+                );
+                out |= (_mm256_movemask_epi8(x) as u32 as u64) << (h * 32);
+            }
+            return out;
+        }
+        #[cfg(not(target_feature = "avx2"))]
+        {
+            use std::arch::x86_64::*;
+            let c = _mm_set1_epi8(b',' as i8);
+            let n = _mm_set1_epi8(b'\n' as i8);
+            let q = _mm_set1_epi8(b'"' as i8);
+            let mut out = 0u64;
+            for h in 0..4 {
+                let v = _mm_loadu_si128(b.as_ptr().add(h * 16) as *const __m128i);
+                let x = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, c), _mm_cmpeq_epi8(v, n)), _mm_cmpeq_epi8(v, q));
+                out |= (_mm_movemask_epi8(x) as u32 as u64 & 0xFFFF) << (h * 16);
+            }
+            return out;
+        }
+    }
+    #[allow(unreachable_code)]
+    {
+        let mut out = 0u64;
+        for (i, &x) in b.iter().enumerate() {
+            if x == b',' || x == b'\n' || x == b'"' {
+                out |= 1 << i;
+            }
+        }
+        out
     }
 }
 
@@ -751,31 +965,26 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             has_min[r] = true;
         }
     }
-    // person maps: user key -> person key (only for linked IDs whose person differs)
-    let person_maps: Vec<KMap<Key>> = {
+    // person map: user key -> person key (only for linked IDs whose name differs)
+    let pmap: PMap = {
         let pk = &part_keys;
-        let cells: Vec<Mutex<KMap<Key>>> = (0..LP).map(|_| Mutex::new(kmap(0))).collect();
+        let cells: Vec<Mutex<PSub>> = (0..LP).map(|_| Mutex::new(PSub::new(0))).collect();
         pool(nt, LP, || (), |_, p| {
             let (_, keys) = &pk[p];
-            let mut m: KMap<Key> = kmap(keys.len());
+            let mut m = PSub::new(keys.len());
             for (li, &k) in keys.iter().enumerate() {
                 let gi = offs[p] as usize + li;
                 let name = root_min[roots[gi] as usize];
                 if name != k {
-                    m.insert(k, name);
+                    m.insert(k, khash(k), name);
                 }
             }
             *cells[p].lock().unwrap() = m;
         });
-        cells.into_iter().map(|c| c.into_inner().unwrap()).collect()
+        PMap { parts: cells.into_iter().map(|c| c.into_inner().unwrap()).collect() }
     };
     part_keys.clear();
-    let person_of = |u: Key| -> Key {
-        match person_maps[lpart(khash(u))].get(&u) {
-            Some(&p) => p,
-            None => u,
-        }
-    };
+    let person_of = |u: Key| -> Key { pmap.get(u, khash(u)) };
     lg(&format!("links done: {} ids", nnodes));
 
     // --- 4. parse events + clicks -------------------------------------------
@@ -783,12 +992,17 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ev: Vec<Vec<ERec>>,
         ck: Vec<Vec<CRec>>,
     }
+    let ev_bytes: usize = data_chunks.iter().filter(|c| c.0 == 1).map(|c| c.1.end - c.1.start).sum();
+    let ck_bytes: usize = data_chunks.iter().filter(|c| c.0 == 2).map(|c| c.1.end - c.1.start).sum();
+    // generous per-thread per-bucket reservations (untouched capacity costs nothing)
+    let ev_cap = ev_bytes / 70 / nt / NE * 3 / 2 + 16;
+    let ck_cap = ck_bytes / 50 / nt / NP * 3 / 2 + 16;
     let pstates = pool(
         nt,
         data_chunks.len(),
         || PState {
-            ev: (0..NE).map(|_| Vec::new()).collect(),
-            ck: (0..NP).map(|_| Vec::new()).collect(),
+            ev: (0..NE).map(|_| Vec::with_capacity(ev_cap)).collect(),
+            ck: (0..NP).map(|_| Vec::with_capacity(ck_cap)).collect(),
         },
         |st, i| {
             let (kind, c) = data_chunks[i];
@@ -866,10 +1080,12 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lg("parse done");
 
     // --- 5. dedup events per event bucket -> person buckets -----------------
+    let n_ev: usize = pstates.iter().map(|s| s.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
+    let pr_cap = n_ev / nt / NP * 3 / 2 + 16;
     let dstates = pool(
         nt,
         NE,
-        || ((0..NP).map(|_| Vec::<PRec>::new()).collect::<Vec<_>>(), kmap::<(i64, u32, u32)>(0)),
+        || ((0..NP).map(|_| Vec::<PRec>::with_capacity(pr_cap)).collect::<Vec<_>>(), kmap::<(i64, u32, u32)>(0)),
         |st, b| {
             let (out, table) = st;
             table.clear();
@@ -889,19 +1105,38 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
             }
-            for &(_, si, ri) in table.values() {
-                let r = &pstates[si as usize].ev[b][ri as usize];
-                if r.flags & F_VALID == 0 {
-                    continue;
+            // Sequential scan; resolve persons in batches with prefetching.
+            let mut cand = [(0u32, 0u64); 32];
+            for (si, src) in pstates.iter().enumerate() {
+                let v = &src.ev[b];
+                let mut ri = 0usize;
+                while ri < v.len() {
+                    let mut n = 0usize;
+                    while ri < v.len() && n < 32 {
+                        let r = &v[ri];
+                        if r.flags & F_VALID != 0 {
+                            let w = table[&r.eid];
+                            if w.1 == si as u32 && w.2 == ri as u32 {
+                                let h = khash(r.user);
+                                pmap.prefetch(h);
+                                cand[n] = (ri as u32, h);
+                                n += 1;
+                            }
+                        }
+                        ri += 1;
+                    }
+                    for &(ci, h) in &cand[..n] {
+                        let r = &v[ci as usize];
+                        let person = pmap.get(r.user, h);
+                        out[pbucket(khash(person))].push(PRec {
+                            person,
+                            ts: r.ts,
+                            price: r.price,
+                            cat: r.cat,
+                            flags: r.flags,
+                        });
+                    }
                 }
-                let person = person_of(r.user);
-                out[pbucket(khash(person))].push(PRec {
-                    person,
-                    ts: r.ts,
-                    price: r.price,
-                    cat: r.cat,
-                    flags: r.flags,
-                });
             }
         },
     );
@@ -1214,7 +1449,8 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Err(e.into());
     }
     lg("write done");
-    Ok(())
+    // Exit right here: dropping the multi-GB working set would cost ~0.2 s.
+    std::process::exit(0);
 }
 
 #[inline]

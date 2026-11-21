@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 arrow = { version = "60.1.0", default-features = false }
+libc = "0.2"
 memchr = "2.7"
 memmap2 = "0.9.12"
 parquet = { version = "60.1.0", default-features = false, features = ["arrow"] }
@@ -15,4 +16,5 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = false
+debug = 1

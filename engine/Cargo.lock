@@ -323,6 +323,7 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "libc",
  "memchr",
  "memmap2",
  "parquet",
