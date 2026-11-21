@@ -1,7 +1,5 @@
-use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,10 +9,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
-use memmap2::Mmap;
+use chrono::NaiveDate;
 use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------

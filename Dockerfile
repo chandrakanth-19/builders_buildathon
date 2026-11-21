@@ -1,8 +1,8 @@
 # Multi-stage build for ultra-fast native execution
-FROM rust:1.85-bookworm AS builder
+FROM rust:bookworm AS builder
 
 WORKDIR /build
-COPY engine/Cargo.toml engine/Cargo.lock* ./
+COPY engine/Cargo.toml engine/Cargo.lock ./
 COPY engine/src ./src
 RUN cargo build --release
 

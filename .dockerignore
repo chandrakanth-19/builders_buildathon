@@ -1,5 +1,12 @@
+target/
+engine/target/
 fixtures/
 dev/
+dev5m/
+dev-answer/
+generator/
 out/
 *.md
 .git
+.venv*
+*.log
