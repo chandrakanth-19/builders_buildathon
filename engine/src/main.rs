@@ -482,24 +482,17 @@ fn for_each_line<const N: usize, F: FnMut(&[&[u8]; N])>(buf: &[u8], mut f: F) {
             f(&fields);
             return;
         }
+        // Branch-free: a field is quoted iff it has >= 2 bytes and '"' at both ends; any
+        // other quote anywhere makes the line's quote count exceed 2 x quoted fields.
         let mut quoted = 0u32;
         let mut s = ls;
         for i in 0..N {
             let e = if i < N - 1 { commas[i] } else { le };
-            let fl = &buf[s..e];
-            let n = fl.len();
-            if n > 0 && fl[0] == b'"' {
-                if n < 2 || fl[n - 1] != b'"' {
-                    return;
-                }
-                fields[i] = &fl[1..n - 1];
-                quoted += 1;
-            } else {
-                if n > 0 && fl[n - 1] == b'"' {
-                    return;
-                }
-                fields[i] = fl;
-            }
+            let first = *buf.get(s).unwrap_or(&0);
+            let last = *buf.get(e.wrapping_sub(1)).unwrap_or(&0);
+            let q = ((e >= s + 2) & (first == b'"') & (last == b'"')) as usize;
+            fields[i] = &buf[s + q..e - q];
+            quoted += q as u32;
             s = e + 1;
         }
         if qcount != 2 * quoted {
@@ -606,17 +599,44 @@ fn days_from_civil(mut y: i32, m: u32, d: u32) -> i64 {
     era as i64 * 146097 + doe as i64 - 719468
 }
 
+/// True where every byte selected by `m` is an ASCII digit.
+#[inline(always)]
+fn swar_digits(x: u64, m: u64) -> bool {
+    let hi_ok = (x & 0xF0F0_F0F0_F0F0_F0F0 & m) == (0x3030_3030_3030_3030 & m);
+    let lo_ok = (((x & 0x0F0F_0F0F_0F0F_0F0F) + 0x0606_0606_0606_0606) & 0x1010_1010_1010_1010 & m) == 0;
+    hi_ok & lo_ok
+}
+
+#[inline(always)]
+fn byte_at(x: u64, i: u32) -> u32 {
+    ((x >> (8 * i)) & 0xFF) as u32
+}
+
+/// Seconds since the epoch for `YYYY-MM-DDTHH:MM:SS` at the start of `s` (len >= 20),
+/// validated with a few 64-bit operations (SWAR) instead of per-byte branches.
 #[inline(always)]
 fn civil_secs(s: &[u8]) -> Option<i64> {
-    if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+    let a = u64::from_le_bytes(s[0..8].try_into().unwrap()); // "YYYY-MM-"
+    let b = u64::from_le_bytes(s[8..16].try_into().unwrap()); // "DDTHH:MM"
+    let c = u32::from_le_bytes(s[16..20].try_into().unwrap()) as u64; // ":SS?"
+    const DA: u64 = 0x00FF_FF00_FFFF_FFFF;
+    const DB: u64 = 0xFFFF_00FF_FF00_FFFF;
+    const DC: u64 = 0x0000_0000_00FF_FF00;
+    let seps = ((a & 0xFF00_00FF_0000_0000) == 0x2D00_002D_0000_0000)
+        & ((b & 0x0000_FF00_00FF_0000) == 0x0000_3A00_0054_0000)
+        & ((c & 0xFF) == 0x3A);
+    if !(seps & swar_digits(a, DA) & swar_digits(b, DB) & swar_digits(c, DC)) {
         return None;
     }
-    let y = d2(s, 0)? * 100 + d2(s, 2)?;
-    let m = d2(s, 5)?;
-    let d = d2(s, 8)?;
-    let h = d2(s, 11)?;
-    let mi = d2(s, 14)?;
-    let se = d2(s, 17)?;
+    let a = (a & DA) - (0x3030_3030_3030_3030 & DA);
+    let b = (b & DB) - (0x3030_3030_3030_3030 & DB);
+    let c = (c & DC) - (0x3030_3030_3030_3030 & DC);
+    let y = byte_at(a, 0) * 1000 + byte_at(a, 1) * 100 + byte_at(a, 2) * 10 + byte_at(a, 3);
+    let m = byte_at(a, 5) * 10 + byte_at(a, 6);
+    let d = byte_at(b, 0) * 10 + byte_at(b, 1);
+    let h = byte_at(b, 3) * 10 + byte_at(b, 4);
+    let mi = byte_at(b, 6) * 10 + byte_at(b, 7);
+    let se = byte_at(c, 1) * 10 + byte_at(c, 2);
     if m == 0 || m > 12 || d == 0 || h > 23 || mi > 59 || se > 59 {
         return None;
     }
@@ -1797,4 +1817,109 @@ fn top_cat(acc: &[(u16, i64)], rank: &[u32]) -> i32 {
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The original per-byte parser, kept as a reference for differential testing.
+    fn ref_civil_secs(s: &[u8]) -> Option<i64> {
+        if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        let y = d2(s, 0)? * 100 + d2(s, 2)?;
+        let m = d2(s, 5)?;
+        let d = d2(s, 8)?;
+        let h = d2(s, 11)?;
+        let mi = d2(s, 14)?;
+        let se = d2(s, 17)?;
+        if m == 0 || m > 12 || d == 0 || h > 23 || mi > 59 || se > 59 {
+            return None;
+        }
+        let leap = (y % 4 == 0) && (y % 100 != 0 || y % 400 == 0);
+        let dim = match m {
+            2 => if leap { 29 } else { 28 },
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        if d > dim {
+            return None;
+        }
+        Some(days_from_civil(y as i32, m, d) * 86400 + (h * 3600 + mi * 60 + se) as i64)
+    }
+
+    fn ref_parse_ts(s: &[u8]) -> Option<i64> {
+        let n = s.len();
+        if n == 20 && s[19] == b'Z' {
+            return ref_civil_secs(s).map(|v| v * 1000);
+        }
+        if n == 25 && (s[19] == b'+' || s[19] == b'-') && s[22] == b':' {
+            let base = ref_civil_secs(s)?;
+            let oh = d2(s, 20)?;
+            let om = d2(s, 23)?;
+            if oh > 23 || om > 59 {
+                return None;
+            }
+            let off = (oh * 3600 + om * 60) as i64;
+            return Some(base - if s[19] == b'+' { off } else { -off }) .map(|v| v * 1000);
+        }
+        if n == 0 {
+            return None;
+        }
+        let mut v: i64 = 0;
+        for &b in s {
+            let d = b.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            v = v.checked_mul(10)?.checked_add(d as i64)?;
+        }
+        Some(v)
+    }
+
+    #[test]
+    fn swar_timestamps_match_reference() {
+        let seeds: [&[u8]; 8] = [
+            b"2026-10-03T23:58:10Z",
+            b"2026-10-03T19:58:10-04:00",
+            b"2028-02-29T00:00:00Z",
+            b"2027-02-29T00:00:00Z",
+            b"2026-12-31T24:00:00Z",
+            b"2026-01-01T00:00:60+05:60",
+            b"1791071890000",
+            b"0000-00-00T00:00:00+24:00",
+        ];
+        let alphabet = b"0123456789-T:Z+zt \".";
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut checked = 0;
+        for seed in seeds {
+            assert_eq!(parse_ts(seed), ref_parse_ts(seed), "{:?}", std::str::from_utf8(seed));
+            for _ in 0..250_000 {
+                let mut v = seed.to_vec();
+                for _ in 0..(rnd() % 3 + 1) {
+                    let i = (rnd() as usize) % v.len();
+                    v[i] = alphabet[(rnd() as usize) % alphabet.len()];
+                }
+                assert_eq!(parse_ts(&v), ref_parse_ts(&v), "{:?}", String::from_utf8_lossy(&v));
+                checked += 1;
+            }
+        }
+        // every valid civil date/time over a range of years, months and days
+        for y in [1970u32, 2000, 2024, 2025, 2026, 2027, 2028, 2100, 2400, 9999] {
+            for m in 0..=13u32 {
+                for d in 0..=32u32 {
+                    let t = format!("{:04}-{:02}-{:02}T12:34:56Z", y, m, d);
+                    assert_eq!(parse_ts(t.as_bytes()), ref_parse_ts(t.as_bytes()), "{t}");
+                }
+            }
+        }
+        assert!(checked > 1_000_000);
+    }
 }
