@@ -3,15 +3,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ahash::{AHashMap, AHashSet};
-use arrow::array::{
-    ArrayRef, Date32Array, Int64Array, StringArray,
-};
+use ahash::{AHashMap, AHashSet, RandomState};
+use arrow::array::{ArrayRef, Date32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate};
 use parquet::arrow::ArrowWriter;
 use rayon::prelude::*;
+
+const NUM_SHARDS: usize = 64;
+
+#[inline(always)]
+fn get_shard(hash: u64) -> usize {
+    (hash as usize) & (NUM_SHARDS - 1)
+}
 
 // ---------------------------------------------------------------------------
 // Helpers: CSV dialect and fields
@@ -23,8 +28,9 @@ fn parse_field(field: &[u8]) -> Option<&[u8]> {
         return Some(b"");
     }
     if field[0] == b'"' {
-        if field.len() >= 2 && field[field.len() - 1] == b'"' {
-            let inner = &field[1..field.len() - 1];
+        let n = field.len();
+        if n >= 2 && field[n - 1] == b'"' {
+            let inner = &field[1..n - 1];
             if !inner.contains(&b'"') {
                 return Some(inner);
             }
@@ -55,7 +61,7 @@ fn split_line<'a>(line: &'a [u8], expected_fields: usize) -> Option<Vec<&'a [u8]
 }
 
 // ---------------------------------------------------------------------------
-// Timestamp parser: F1, F2, F3
+// Fast Timestamp parser: F1, F2, F3
 // ---------------------------------------------------------------------------
 
 #[inline(always)]
@@ -148,8 +154,6 @@ fn epoch_ms_to_date_days(epoch_ms: i64) -> i32 {
     (dt.date_naive() - epoch).num_days() as i32
 }
 
-use chrono::DateTime;
-
 // ---------------------------------------------------------------------------
 // Union-Find
 // ---------------------------------------------------------------------------
@@ -216,32 +220,58 @@ impl DisjointSet {
 }
 
 // ---------------------------------------------------------------------------
-// Event and Click Data Structures
+// Compact Data Structures
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct RawEventRecord {
-    ingest_ms: i64,
+struct CompactRawEvent {
+    event_id: Vec<u8>,
     user_id: Vec<u8>,
+    ingest_ms: i64,
+    ts_ms: i64,       // -1 if invalid or outside window
+    price: i32,       // -1 if invalid
+    cat_id: u8,
+    ev_type: u8,      // 0 = view, 1 = cart, 2 = purchase, 3 = invalid
+    is_valid_syntax: bool,
+}
+
+#[derive(Clone)]
+struct RawClickItem {
+    click_id: Vec<u8>,
+    user_id: Vec<u8>,
+    campaign_id: Vec<u8>,
     ts_bytes: Vec<u8>,
-    ev_type: Vec<u8>,
-    product_id: Vec<u8>,
-    price_bytes: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
 struct ValidEvent {
-    person: Vec<u8>,
     ts: i64,
+    price: i32,
+    cat_id: u8,
     is_purchase: bool,
-    price_cents: i64,
-    category: Vec<u8>,
 }
 
+#[derive(Clone)]
 struct ValidClick {
     click_id: Vec<u8>,
-    person: Vec<u8>,
     campaign_id: Vec<u8>,
     ts: i64,
+}
+
+// Aggregations
+struct UserDayAgg {
+    sessions: i64,
+    events: i64,
+    revenue_cents: i64,
+    cat_rev: [i64; 32], // up to 32 categories, zero heap allocation
+}
+
+#[derive(Default)]
+struct CampDayAgg {
+    sessions: i64,
+    purchasing_sessions: i64,
+    revenue_cents: i64,
+    assisted_sessions: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -266,8 +296,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    eprintln!("[{:.2}s] Starting Shopping Sessions engine (Rust)", t0.elapsed().as_secs_f64());
-    eprintln!("DATA_DIR: {}, OUTPUT_DIR: {}", data_dir, out_dir);
+    let hasher = RandomState::new();
+
+    eprintln!("[{:.2}s] Starting Shopping Sessions engine (Rust extreme)", t0.elapsed().as_secs_f64());
 
     // 1. Manifest
     let manifest_path = Path::new(&data_dir).join("manifest.json");
@@ -279,8 +310,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let win_end_ms = parse_ts(win_end_str.as_bytes()).unwrap();
     let click_win_start_ms = win_start_ms - 7 * 86_400_000;
 
-    // 2. Products
-    let mut products = AHashMap::new();
+    // 2. Categories & Products
+    // There are only ~20 categories. Map each category string to a u8 ID.
+    let mut category_names: Vec<Vec<u8>> = Vec::new();
+    let mut cat_name_to_id: AHashMap<Vec<u8>, u8> = AHashMap::new();
+
+    // category 0 is always "unknown"
+    category_names.push(b"unknown".to_vec());
+    cat_name_to_id.insert(b"unknown".to_vec(), 0);
+
+    let mut product_to_cat: AHashMap<Vec<u8>, u8> = AHashMap::new();
     let products_path = Path::new(&data_dir).join("products.csv");
     if products_path.exists() {
         let content = std::fs::read(&products_path)?;
@@ -289,11 +328,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for line in lines {
             if let Some(f) = split_line(line, 2) {
                 if !f[0].is_empty() && !f[1].is_empty() {
-                    products.insert(f[0].to_vec(), f[1].to_vec());
+                    let cat_id = *cat_name_to_id.entry(f[1].to_vec()).or_insert_with(|| {
+                        let id = category_names.len() as u8;
+                        category_names.push(f[1].to_vec());
+                        id
+                    });
+                    product_to_cat.insert(f[0].to_vec(), cat_id);
                 }
             }
         }
     }
+    let product_to_cat = Arc::new(product_to_cat);
+    let category_names = Arc::new(category_names);
 
     // 3. Campaigns
     let mut campaigns = AHashMap::new();
@@ -310,6 +356,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    let campaigns = Arc::new(campaigns);
 
     // 4. Links
     eprintln!("[{:.2}s] Processing links...", t0.elapsed().as_secs_f64());
@@ -339,8 +386,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 5. Events
-    eprintln!("[{:.2}s] Reading events...", t0.elapsed().as_secs_f64());
+    // Pre-resolve all known names in DSU to make lookup lock-free
+    let mut canonical_map: AHashMap<Vec<u8>, Vec<u8>> = AHashMap::new();
+    let dsu_keys: Vec<Vec<u8>> = dsu.map.keys().cloned().collect();
+    for k in dsu_keys {
+        let canon = dsu.get_canonical_name(&k);
+        canonical_map.insert(k, canon);
+    }
+    let canonical_map = Arc::new(canonical_map);
+
+    let get_person = {
+        let canonical_map = Arc::clone(&canonical_map);
+        move |user_id: &[u8]| -> Vec<u8> {
+            canonical_map.get(user_id).cloned().unwrap_or_else(|| user_id.to_vec())
+        }
+    };
+
+    // 5. Parallel Event Reading & Immediate In-Flight Parsing
+    eprintln!("[{:.2}s] Parallel reading events...", t0.elapsed().as_secs_f64());
     let events_dir = Path::new(&data_dir).join("events");
     let mut event_files: Vec<_> = std::fs::read_dir(&events_dir)?
         .filter_map(|e| e.ok())
@@ -349,14 +412,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     event_files.sort();
 
-    // Parallel parse of event files
-    let parsed_event_batches: Vec<Vec<(Vec<u8>, RawEventRecord)>> = event_files
+    let file_event_shards: Vec<Vec<Vec<CompactRawEvent>>> = event_files
         .par_iter()
         .map(|ef| {
             let content = std::fs::read(ef).unwrap_or_default();
             let mut lines = content.split(|&b| b == b'\n');
             lines.next(); // header
-            let mut batch = Vec::new();
+            let mut local_shards: Vec<Vec<CompactRawEvent>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
             for line in lines {
                 if let Some(f) = split_line(line, 7) {
                     let event_id = f[0];
@@ -364,89 +426,119 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                     if let Some(ingest_ms) = parse_ts(f[3]) {
-                        batch.push((
-                            event_id.to_vec(),
-                            RawEventRecord {
-                                ingest_ms,
-                                user_id: f[1].to_vec(),
-                                ts_bytes: f[2].to_vec(),
-                                ev_type: f[4].to_vec(),
-                                product_id: f[5].to_vec(),
-                                price_bytes: f[6].to_vec(),
-                            },
-                        ));
+                        let ev_type = match f[4] {
+                            b"view" => 0,
+                            b"cart" => 1,
+                            b"purchase" => 2,
+                            _ => 3,
+                        };
+
+                        let ts_ms = parse_ts(f[2]).unwrap_or(-1);
+                        let in_win_ts = if ts_ms >= win_start_ms && ts_ms < win_end_ms { ts_ms } else { -1 };
+
+                        let mut price_val: i32 = 0;
+                        let mut price_valid = true;
+                        if ev_type == 2 {
+                            let p_bytes = f[6];
+                            if p_bytes.is_empty() || !p_bytes.iter().all(|&c| c >= b'0' && c <= b'9') {
+                                price_valid = false;
+                            } else {
+                                match parse_digits(p_bytes) {
+                                    Some(p) if p >= 1 && p <= 10_000_000 => price_val = p as i32,
+                                    _ => price_valid = false,
+                                }
+                            }
+                        }
+
+                        let is_prod_non_empty = !f[5].is_empty();
+                        let is_user_non_empty = !f[1].is_empty();
+                        let cat_id = product_to_cat.get(f[5]).copied().unwrap_or(0);
+
+                        let is_valid_syntax = is_prod_non_empty
+                            && is_user_non_empty
+                            && ev_type != 3
+                            && in_win_ts != -1
+                            && price_valid;
+
+                        let sid = get_shard(hasher.hash_one(event_id));
+                        local_shards[sid].push(CompactRawEvent {
+                            event_id: event_id.to_vec(),
+                            user_id: f[1].to_vec(),
+                            ingest_ms,
+                            ts_ms: in_win_ts,
+                            price: price_val,
+                            cat_id,
+                            ev_type,
+                            is_valid_syntax,
+                        });
                     }
                 }
             }
-            batch
+            local_shards
         })
         .collect();
 
-    eprintln!("[{:.2}s] Deduplicating and validating events...", t0.elapsed().as_secs_f64());
-    // Dedup events on event_id keeping smallest ingest_ts
-    let mut events_by_id: AHashMap<Vec<u8>, RawEventRecord> = AHashMap::new();
-    for batch in parsed_event_batches {
-        for (eid, rec) in batch {
-            match events_by_id.get_mut(&eid) {
-                Some(existing) => {
-                    if rec.ingest_ms < existing.ingest_ms {
-                        *existing = rec;
+    let mut global_event_shards: Vec<Vec<CompactRawEvent>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+    for local_shards in file_event_shards {
+        for (sid, items) in local_shards.into_iter().enumerate() {
+            global_event_shards[sid].extend(items);
+        }
+    }
+
+    // 6. Parallel Dedup & Validation -> Shard by hash(person)
+    eprintln!("[{:.2}s] Parallel deduplicating & validating events...", t0.elapsed().as_secs_f64());
+    let person_event_buffers: Vec<Vec<Vec<(Vec<u8>, ValidEvent)>>> = global_event_shards
+        .into_par_iter()
+        .map(|shard_items| {
+            let mut events_by_id: AHashMap<Vec<u8>, CompactRawEvent> = AHashMap::with_capacity(shard_items.len());
+            for item in shard_items {
+                match events_by_id.get_mut(&item.event_id) {
+                    Some(existing) => {
+                        if item.ingest_ms < existing.ingest_ms {
+                            *existing = item;
+                        }
+                    }
+                    None => {
+                        let eid = item.event_id.clone();
+                        events_by_id.insert(eid, item);
                     }
                 }
-                None => {
-                    events_by_id.insert(eid, rec);
+            }
+
+            let mut person_shards: Vec<Vec<(Vec<u8>, ValidEvent)>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+            for (_, rec) in events_by_id {
+                if !rec.is_valid_syntax {
+                    continue;
                 }
+                // Late event: ingest_ts - ts > 24 hours
+                if rec.ingest_ms - rec.ts_ms > 86_400_000 {
+                    continue;
+                }
+
+                let person = get_person(&rec.user_id);
+                let p_shard = get_shard(hasher.hash_one(&person));
+                person_shards[p_shard].push((person, ValidEvent {
+                    ts: rec.ts_ms,
+                    price: rec.price,
+                    cat_id: rec.cat_id,
+                    is_purchase: rec.ev_type == 2,
+                }));
+            }
+            person_shards
+        })
+        .collect();
+
+    let mut person_event_shards: Vec<AHashMap<Vec<u8>, Vec<ValidEvent>>> = (0..NUM_SHARDS).map(|_| AHashMap::new()).collect();
+    for sub_shards in person_event_buffers {
+        for (sid, items) in sub_shards.into_iter().enumerate() {
+            for (person, ev) in items {
+                person_event_shards[sid].entry(person).or_default().push(ev);
             }
         }
     }
 
-    // Validate kept copies
-    let mut person_events: AHashMap<Vec<u8>, Vec<ValidEvent>> = AHashMap::new();
-    for (_, rec) in events_by_id {
-        if rec.user_id.is_empty() || rec.product_id.is_empty() {
-            continue;
-        }
-        if rec.ev_type != b"view" && rec.ev_type != b"cart" && rec.ev_type != b"purchase" {
-            continue;
-        }
-        let ts_ms = match parse_ts(&rec.ts_bytes) {
-            Some(t) if t >= win_start_ms && t < win_end_ms => t,
-            _ => continue,
-        };
-
-        let mut price_val: i64 = 0;
-        let is_purchase = rec.ev_type == b"purchase";
-        if is_purchase {
-            if rec.price_bytes.is_empty() || !rec.price_bytes.iter().all(|&c| c >= b'0' && c <= b'9') {
-                continue;
-            }
-            price_val = match parse_digits(&rec.price_bytes) {
-                Some(p) if p >= 1 && p <= 10_000_000 => p as i64,
-                _ => continue,
-            };
-        }
-
-        // Late event check: ingest_ts - ts > 24 hours (86_400_000 ms)
-        if rec.ingest_ms - ts_ms > 86_400_000 {
-            continue;
-        }
-
-        let person = dsu.get_canonical_name(&rec.user_id);
-        let category = products.get(&rec.product_id)
-            .cloned()
-            .unwrap_or_else(|| b"unknown".to_vec());
-
-        person_events.entry(person.clone()).or_default().push(ValidEvent {
-            person,
-            ts: ts_ms,
-            is_purchase,
-            price_cents: price_val,
-            category,
-        });
-    }
-
-    // 6. Clicks
-    eprintln!("[{:.2}s] Reading and validating clicks...", t0.elapsed().as_secs_f64());
+    // 7. Parallel Click Reading & Validation
+    eprintln!("[{:.2}s] Parallel reading & validating clicks...", t0.elapsed().as_secs_f64());
     let clicks_dir = Path::new(&data_dir).join("clicks");
     let mut click_files: Vec<_> = std::fs::read_dir(&clicks_dir)?
         .filter_map(|e| e.ok())
@@ -455,218 +547,240 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     click_files.sort();
 
-    let parsed_click_batches: Vec<Vec<(Vec<u8>, (Vec<u8>, Vec<u8>, Vec<u8>))>> = click_files
+    let file_click_shards: Vec<Vec<Vec<RawClickItem>>> = click_files
         .par_iter()
         .map(|cf| {
             let content = std::fs::read(cf).unwrap_or_default();
             let mut lines = content.split(|&b| b == b'\n');
             lines.next(); // header
-            let mut batch = Vec::new();
+            let mut local_shards: Vec<Vec<RawClickItem>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
             for line in lines {
                 if let Some(f) = split_line(line, 4) {
                     let click_id = f[0];
                     if click_id.is_empty() {
                         continue;
                     }
-                    batch.push((
-                        click_id.to_vec(),
-                        (f[1].to_vec(), f[2].to_vec(), f[3].to_vec()),
-                    ));
+                    let sid = get_shard(hasher.hash_one(click_id));
+                    local_shards[sid].push(RawClickItem {
+                        click_id: click_id.to_vec(),
+                        user_id: f[1].to_vec(),
+                        campaign_id: f[2].to_vec(),
+                        ts_bytes: f[3].to_vec(),
+                    });
                 }
             }
-            batch
+            local_shards
         })
         .collect();
 
-    let mut clicks_by_id: AHashMap<Vec<u8>, (Vec<u8>, Vec<u8>, Vec<u8>)> = AHashMap::new();
-    for batch in parsed_click_batches {
-        for (cid, rec) in batch {
-            clicks_by_id.entry(cid).or_insert(rec);
+    let mut global_click_shards: Vec<Vec<RawClickItem>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+    for local_shards in file_click_shards {
+        for (sid, items) in local_shards.into_iter().enumerate() {
+            global_click_shards[sid].extend(items);
         }
     }
 
-    let mut person_clicks: AHashMap<Vec<u8>, Vec<ValidClick>> = AHashMap::new();
-    for (click_id, (user_id, campaign_id, ts_bytes)) in clicks_by_id {
-        if user_id.is_empty() || campaign_id.is_empty() {
-            continue;
-        }
-        if !campaigns.contains_key(&campaign_id) {
-            continue;
-        }
-        let ts_ms = match parse_ts(&ts_bytes) {
-            Some(t) if t >= click_win_start_ms && t < win_end_ms => t,
-            _ => continue,
-        };
-
-        let person = dsu.get_canonical_name(&user_id);
-        person_clicks.entry(person.clone()).or_default().push(ValidClick {
-            click_id,
-            person,
-            campaign_id,
-            ts: ts_ms,
-        });
-    }
-
-    // Sort clicks per person by ts ASC, then click_id ASC
-    for clicks in person_clicks.values_mut() {
-        clicks.sort_by(|a, b| {
-            a.ts.cmp(&b.ts).then_with(|| a.click_id.cmp(&b.click_id))
-        });
-    }
-
-    // 7. Sessionization, Attribution & Assists per Person
-    eprintln!("[{:.2}s] Sessionizing & attributing...", t0.elapsed().as_secs_f64());
-
-    // Daily aggregations
-    // Key: (user_id, day_days) -> (sessions, events, revenue_cents, top_cat_map)
-    struct UserDayAgg {
-        sessions: i64,
-        events: i64,
-        revenue_cents: i64,
-        cat_rev: AHashMap<Vec<u8>, i64>,
-    }
-    let mut user_daily_agg: AHashMap<(Vec<u8>, i32), UserDayAgg> = AHashMap::new();
-
-    // Key: (campaign_id, day_days) -> (sessions, purchasing_sessions, revenue_cents, assisted_sessions)
-    #[derive(Default)]
-    struct CampDayAgg {
-        sessions: i64,
-        purchasing_sessions: i64,
-        revenue_cents: i64,
-        assisted_sessions: i64,
-    }
-    let mut camp_daily_agg: AHashMap<(Vec<u8>, i32), CampDayAgg> = AHashMap::new();
-
-    for (person, mut events) in person_events {
-        events.sort_by_key(|e| e.ts);
-
-        // Sessionize
-        let mut i = 0;
-        let n = events.len();
-        let person_clk = person_clicks.get(&person);
-
-        while i < n {
-            let session_start = events[i].ts;
-            let session_day = epoch_ms_to_date_days(session_start);
-
-            let mut session_events_count: i64 = 0;
-            let mut session_revenue: i64 = 0;
-            let mut session_has_purchase = false;
-            let mut session_cat_rev: AHashMap<Vec<u8>, i64> = AHashMap::new();
-
-            let mut cur_ts = session_start;
-            while i < n {
-                let ev = &events[i];
-                if ev.ts - cur_ts > 1_800_000 {
-                    break;
-                }
-                cur_ts = ev.ts;
-                session_events_count += 1;
-                if ev.is_purchase {
-                    session_has_purchase = true;
-                    session_revenue += ev.price_cents;
-                    *session_cat_rev.entry(ev.category.clone()).or_insert(0) += ev.price_cents;
-                }
-                i += 1;
+    let person_click_buffers: Vec<Vec<Vec<(Vec<u8>, ValidClick)>>> = global_click_shards
+        .into_par_iter()
+        .map(|shard_items| {
+            let mut clicks_by_id: AHashMap<Vec<u8>, RawClickItem> = AHashMap::with_capacity(shard_items.len());
+            for item in shard_items {
+                clicks_by_id.entry(item.click_id.clone()).or_insert(item);
             }
 
-            // Update user daily
-            let u_agg = user_daily_agg.entry((person.clone(), session_day)).or_insert_with(|| UserDayAgg {
-                sessions: 0,
-                events: 0,
-                revenue_cents: 0,
-                cat_rev: AHashMap::new(),
-            });
-            u_agg.sessions += 1;
-            u_agg.events += session_events_count;
-            u_agg.revenue_cents += session_revenue;
-            for (c, rev) in session_cat_rev {
-                *u_agg.cat_rev.entry(c).or_insert(0) += rev;
+            let mut person_shards: Vec<Vec<(Vec<u8>, ValidClick)>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+            for (_, item) in clicks_by_id {
+                if item.user_id.is_empty() || item.campaign_id.is_empty() {
+                    continue;
+                }
+                if !campaigns.contains_key(&item.campaign_id) {
+                    continue;
+                }
+                let ts_ms = match parse_ts(&item.ts_bytes) {
+                    Some(t) if t >= click_win_start_ms && t < win_end_ms => t,
+                    _ => continue,
+                };
+
+                let person = get_person(&item.user_id);
+                let p_shard = get_shard(hasher.hash_one(&person));
+                person_shards[p_shard].push((person, ValidClick {
+                    click_id: item.click_id,
+                    campaign_id: item.campaign_id,
+                    ts: ts_ms,
+                }));
+            }
+            person_shards
+        })
+        .collect();
+
+    let mut person_click_shards: Vec<AHashMap<Vec<u8>, Vec<ValidClick>>> = (0..NUM_SHARDS).map(|_| AHashMap::new()).collect();
+    for sub_shards in person_click_buffers {
+        for (sid, items) in sub_shards.into_iter().enumerate() {
+            for (person, clk) in items {
+                person_click_shards[sid].entry(person).or_default().push(clk);
+            }
+        }
+    }
+
+    // 8. Parallel Sessionization & Attribution across Person Shards
+    eprintln!("[{:.2}s] Parallel sessionizing & attributing across {} shards...", t0.elapsed().as_secs_f64(), NUM_SHARDS);
+
+    let shard_results: Vec<(Vec<((Vec<u8>, i32), UserDayAgg)>, AHashMap<(Vec<u8>, i32), CampDayAgg>)> = person_event_shards
+        .into_par_iter()
+        .zip(person_click_shards.into_par_iter())
+        .map(|(events_map, mut clicks_map)| {
+            for clks in clicks_map.values_mut() {
+                clks.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.click_id.cmp(&b.click_id)));
             }
 
-            // Attribution & Assists
-            let mut credited_camp = b"organic".to_vec();
-            let mut assisting_camps = AHashSet::new();
+            let mut local_user_daily: Vec<((Vec<u8>, i32), UserDayAgg)> = Vec::new();
+            let mut local_camp_daily: AHashMap<(Vec<u8>, i32), CampDayAgg> = AHashMap::new();
 
-            if let Some(clks) = person_clk {
-                let min_click_ts = session_start - 604_800_000;
-                // Binary search for window [min_click_ts, session_start]
-                let start_idx = clks.partition_point(|c| c.ts < min_click_ts);
-                let end_idx = clks.partition_point(|c| c.ts <= session_start);
+            for (person, mut events) in events_map {
+                events.sort_by_key(|e| e.ts);
 
-                if start_idx < end_idx {
-                    let window_clicks = &clks[start_idx..end_idx];
-                    // Latest click has largest ts
-                    let mut best_click: Option<&ValidClick> = None;
-                    for c in window_clicks {
-                        assisting_camps.insert(&c.campaign_id);
-                        match best_click {
-                            None => best_click = Some(c),
-                            Some(curr) => {
-                                if c.ts > curr.ts || (c.ts == curr.ts && c.click_id < curr.click_id) {
-                                    best_click = Some(c);
+                let mut i = 0;
+                let n = events.len();
+                let person_clk = clicks_map.get(&person);
+
+                let mut person_day_aggs: AHashMap<i32, UserDayAgg> = AHashMap::new();
+
+                while i < n {
+                    let session_start = events[i].ts;
+                    let session_day = epoch_ms_to_date_days(session_start);
+
+                    let mut session_events_count: i64 = 0;
+                    let mut session_revenue: i64 = 0;
+                    let mut session_has_purchase = false;
+                    let mut session_cat_rev = [0i64; 32];
+
+                    let mut cur_ts = session_start;
+                    while i < n {
+                        let ev = &events[i];
+                        if ev.ts - cur_ts > 1_800_000 {
+                            break;
+                        }
+                        cur_ts = ev.ts;
+                        session_events_count += 1;
+                        if ev.is_purchase {
+                            session_has_purchase = true;
+                            let p = ev.price as i64;
+                            session_revenue += p;
+                            session_cat_rev[ev.cat_id as usize] += p;
+                        }
+                        i += 1;
+                    }
+
+                    let u_agg = person_day_aggs.entry(session_day).or_insert_with(|| UserDayAgg {
+                        sessions: 0,
+                        events: 0,
+                        revenue_cents: 0,
+                        cat_rev: [0i64; 32],
+                    });
+                    u_agg.sessions += 1;
+                    u_agg.events += session_events_count;
+                    u_agg.revenue_cents += session_revenue;
+                    for c_idx in 0..32 {
+                        u_agg.cat_rev[c_idx] += session_cat_rev[c_idx];
+                    }
+
+                    // Attribution & Assists
+                    let mut credited_camp = b"organic".to_vec();
+                    let mut assisting_camps = AHashSet::new();
+
+                    if let Some(clks) = person_clk {
+                        let min_click_ts = session_start - 604_800_000;
+                        let start_idx = clks.partition_point(|c| c.ts < min_click_ts);
+                        let end_idx = clks.partition_point(|c| c.ts <= session_start);
+
+                        if start_idx < end_idx {
+                            let window_clicks = &clks[start_idx..end_idx];
+                            let mut best_click: Option<&ValidClick> = None;
+                            for c in window_clicks {
+                                assisting_camps.insert(&c.campaign_id);
+                                match best_click {
+                                    None => best_click = Some(c),
+                                    Some(curr) => {
+                                        if c.ts > curr.ts || (c.ts == curr.ts && c.click_id < curr.click_id) {
+                                            best_click = Some(c);
+                                        }
+                                    }
                                 }
+                            }
+                            if let Some(best) = best_click {
+                                credited_camp = best.campaign_id.clone();
                             }
                         }
                     }
-                    if let Some(best) = best_click {
-                        credited_camp = best.campaign_id.clone();
+
+                    let c_agg = local_camp_daily.entry((credited_camp, session_day)).or_default();
+                    c_agg.sessions += 1;
+                    if session_has_purchase {
+                        c_agg.purchasing_sessions += 1;
                     }
+                    c_agg.revenue_cents += session_revenue;
+
+                    for ac in assisting_camps {
+                        local_camp_daily.entry((ac.clone(), session_day)).or_default().assisted_sessions += 1;
+                    }
+                }
+
+                for (day_days, agg) in person_day_aggs {
+                    local_user_daily.push(((person.clone(), day_days), agg));
                 }
             }
 
-            // Update campaign daily for credited campaign
-            let c_agg = camp_daily_agg.entry((credited_camp, session_day)).or_default();
-            c_agg.sessions += 1;
-            if session_has_purchase {
-                c_agg.purchasing_sessions += 1;
-            }
-            c_agg.revenue_cents += session_revenue;
+            (local_user_daily, local_camp_daily)
+        })
+        .collect();
 
-            // Update campaign daily for assisting campaigns
-            for ac in assisting_camps {
-                camp_daily_agg.entry((ac.clone(), session_day)).or_default().assisted_sessions += 1;
-            }
-        }
-    }
-
-    // 8. Write Parquet: user_daily
+    // 9. Write Parquet: user_daily
     eprintln!("[{:.2}s] Writing user_daily Parquet...", t0.elapsed().as_secs_f64());
     let user_out_dir = Path::new(&out_dir).join("user_daily");
     std::fs::create_dir_all(&user_out_dir)?;
 
-    let mut u_user_ids = Vec::with_capacity(user_daily_agg.len());
-    let mut u_days = Vec::with_capacity(user_daily_agg.len());
-    let mut u_sessions = Vec::with_capacity(user_daily_agg.len());
-    let mut u_events = Vec::with_capacity(user_daily_agg.len());
-    let mut u_revenue = Vec::with_capacity(user_daily_agg.len());
-    let mut u_top_cats: Vec<Option<String>> = Vec::with_capacity(user_daily_agg.len());
+    let total_user_rows: usize = shard_results.iter().map(|(u, _)| u.len()).sum();
+    let mut u_user_ids = Vec::with_capacity(total_user_rows);
+    let mut u_days = Vec::with_capacity(total_user_rows);
+    let mut u_sessions = Vec::with_capacity(total_user_rows);
+    let mut u_events = Vec::with_capacity(total_user_rows);
+    let mut u_revenue = Vec::with_capacity(total_user_rows);
+    let mut u_top_cats: Vec<Option<String>> = Vec::with_capacity(total_user_rows);
 
-    for ((person, day_days), agg) in user_daily_agg {
-        let user_id_str = String::from_utf8_lossy(&person).into_owned();
-        let top_cat = if agg.cat_rev.is_empty() {
-            None
-        } else {
-            let mut best_cat: Option<(&Vec<u8>, i64)> = None;
-            for (cat, rev) in &agg.cat_rev {
-                match best_cat {
-                    None => best_cat = Some((cat, *rev)),
-                    Some((curr_cat, curr_rev)) => {
-                        if *rev > curr_rev || (*rev == curr_rev && cat < curr_cat) {
-                            best_cat = Some((cat, *rev));
+    for (user_items, _) in &shard_results {
+        for ((person, day_days), agg) in user_items {
+            let user_id_str = String::from_utf8_lossy(person).into_owned();
+            let mut top_cat_id: Option<u8> = None;
+            let mut best_rev: i64 = 0;
+
+            for (cat_idx, &rev) in agg.cat_rev.iter().enumerate() {
+                if rev > 0 {
+                    match top_cat_id {
+                        None => {
+                            top_cat_id = Some(cat_idx as u8);
+                            best_rev = rev;
+                        }
+                        Some(curr_id) => {
+                            let curr_name = &category_names[curr_id as usize];
+                            let cand_name = &category_names[cat_idx];
+                            if rev > best_rev || (rev == best_rev && cand_name < curr_name) {
+                                top_cat_id = Some(cat_idx as u8);
+                                best_rev = rev;
+                            }
                         }
                     }
                 }
             }
-            best_cat.map(|(cat, _)| String::from_utf8_lossy(cat).into_owned())
-        };
 
-        u_user_ids.push(user_id_str);
-        u_days.push(day_days);
-        u_sessions.push(agg.sessions);
-        u_events.push(agg.events);
-        u_revenue.push(agg.revenue_cents);
-        u_top_cats.push(top_cat);
+            let top_cat_str = top_cat_id.map(|id| String::from_utf8_lossy(&category_names[id as usize]).into_owned());
+
+            u_user_ids.push(user_id_str);
+            u_days.push(*day_days);
+            u_sessions.push(agg.sessions);
+            u_events.push(agg.events);
+            u_revenue.push(agg.revenue_cents);
+            u_top_cats.push(top_cat_str);
+        }
     }
 
     let user_schema = Arc::new(Schema::new(vec![
@@ -697,20 +811,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writer.write(&user_batch)?;
     writer.close()?;
 
-    // 9. Write Parquet: campaign_daily
-    eprintln!("[{:.2}s] Writing campaign_daily Parquet...", t0.elapsed().as_secs_f64());
+    // 10. Merge & Write Parquet: campaign_daily
+    eprintln!("[{:.2}s] Merging & writing campaign_daily Parquet...", t0.elapsed().as_secs_f64());
+    let mut global_camp_daily: AHashMap<(Vec<u8>, i32), CampDayAgg> = AHashMap::new();
+    for (_, camp_map) in shard_results {
+        for (k, v) in camp_map {
+            let entry = global_camp_daily.entry(k).or_default();
+            entry.sessions += v.sessions;
+            entry.purchasing_sessions += v.purchasing_sessions;
+            entry.revenue_cents += v.revenue_cents;
+            entry.assisted_sessions += v.assisted_sessions;
+        }
+    }
+
     let camp_out_dir = Path::new(&out_dir).join("campaign_daily");
     std::fs::create_dir_all(&camp_out_dir)?;
 
-    let mut c_ids = Vec::with_capacity(camp_daily_agg.len());
-    let mut c_channels = Vec::with_capacity(camp_daily_agg.len());
-    let mut c_days = Vec::with_capacity(camp_daily_agg.len());
-    let mut c_sessions = Vec::with_capacity(camp_daily_agg.len());
-    let mut c_purchasing = Vec::with_capacity(camp_daily_agg.len());
-    let mut c_revenue = Vec::with_capacity(camp_daily_agg.len());
-    let mut c_assisted = Vec::with_capacity(camp_daily_agg.len());
+    let mut c_ids = Vec::with_capacity(global_camp_daily.len());
+    let mut c_channels = Vec::with_capacity(global_camp_daily.len());
+    let mut c_days = Vec::with_capacity(global_camp_daily.len());
+    let mut c_sessions = Vec::with_capacity(global_camp_daily.len());
+    let mut c_purchasing = Vec::with_capacity(global_camp_daily.len());
+    let mut c_revenue = Vec::with_capacity(global_camp_daily.len());
+    let mut c_assisted = Vec::with_capacity(global_camp_daily.len());
 
-    for ((camp_id, day_days), agg) in camp_daily_agg {
+    for ((camp_id, day_days), agg) in global_camp_daily {
         let channel = if camp_id == b"organic" {
             "organic".to_string()
         } else {

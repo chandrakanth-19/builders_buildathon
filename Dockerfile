@@ -4,6 +4,7 @@ FROM rust:bookworm AS builder
 WORKDIR /build
 COPY engine/Cargo.toml engine/Cargo.lock ./
 COPY engine/src ./src
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
 RUN cargo build --release
 
 # Slim runtime container
