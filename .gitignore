@@ -10,7 +10,7 @@ __pycache__/
 
 # Temporary and output directories
 out/
-dev/
+
 dev-answer/
 generator/
 duckdb_tmp/
@@ -24,3 +24,4 @@ target/
 
 # Logs
 *.log
+dev*/
