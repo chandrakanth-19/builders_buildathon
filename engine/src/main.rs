@@ -21,12 +21,13 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use arrow::array::{ArrayRef, Date32Array, Int64Array, StringBuilder};
+use arrow::array::{ArrayRef, Date32Array, Int32Array, Int64Array, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use memmap2::Mmap;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
+use parquet::schema::types::ColumnPath;
 
 // ---------------------------------------------------------------------------
 // Allocator: large blocks straight from mmap with transparent huge pages,
@@ -1691,13 +1692,16 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let props = WriterProperties::builder()
         .set_dictionary_enabled(false)
         .set_statistics_enabled(EnabledStatistics::None)
+        // low-cardinality columns: dictionary + bit-packing makes them a few bits per row
+        .set_column_dictionary_enabled(ColumnPath::from("day"), true)
+        .set_column_dictionary_enabled(ColumnPath::from("top_category"), true)
         .build();
 
     let user_schema = Arc::new(Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
-        Field::new("sessions", DataType::Int64, false),
-        Field::new("events", DataType::Int64, false),
+        Field::new("sessions", DataType::Int32, false),
+        Field::new("events", DataType::Int32, false),
         Field::new("revenue_cents", DataType::Int64, false),
         Field::new("top_category", DataType::Utf8, true),
     ]));
@@ -1782,8 +1786,8 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 write_key(r.person, &mut tmp);
                 ub.append_value(std::str::from_utf8(&tmp).map_err(|_| "non-utf8 user id")?);
                 d.push(r.day);
-                s.push(r.sessions);
-                e.push(r.events);
+                s.push(r.sessions as i32);
+                e.push(r.events as i32);
                 rv.push(r.revenue);
                 if r.top >= 0 {
                     tb.append_value(&cat_strs[r.top as usize]);
@@ -1796,8 +1800,8 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 vec![
                     Arc::new(ub.finish()) as ArrayRef,
                     Arc::new(Date32Array::from(d)),
-                    Arc::new(Int64Array::from(s)),
-                    Arc::new(Int64Array::from(e)),
+                    Arc::new(Int32Array::from(s)),
+                    Arc::new(Int32Array::from(e)),
                     Arc::new(Int64Array::from(rv)),
                     Arc::new(tb.finish()),
                 ],
