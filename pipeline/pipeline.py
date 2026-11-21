@@ -9,9 +9,15 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import duckdb
 import pyarrow as pa
+
+t0 = time.time()
+def log_step(msg):
+    sys.stderr.write(f"[{time.time() - t0:.2f}s] {msg}\n")
+    sys.stderr.flush()
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
@@ -115,6 +121,7 @@ def parse_ts(b: bytes):
 
 # ---------------------------------------------------------
 # Load Manifest & Lookups
+log_step("Loading manifest, products, and campaigns...")
 # ---------------------------------------------------------
 
 with open(os.path.join(DATA, "manifest.json")) as f:
@@ -145,6 +152,7 @@ if os.path.exists(campaigns_file):
 
 # ---------------------------------------------------------
 # Union-Find for Linked IDs
+log_step("Processing links...")
 # ---------------------------------------------------------
 
 parent = {}
@@ -182,6 +190,7 @@ for lf in links_glob:
 
 # ---------------------------------------------------------
 # Parse & Validate Events
+log_step("Reading and validating events...")
 # ---------------------------------------------------------
 
 events_glob = sorted(glob.glob(os.path.join(DATA, "events", "*.csv")))
@@ -249,6 +258,7 @@ for ingest_ms, parts in events_by_id.values():
 
 # ---------------------------------------------------------
 # Parse & Validate Clicks
+log_step("Reading and validating clicks...")
 # ---------------------------------------------------------
 
 clicks_glob = sorted(glob.glob(os.path.join(DATA, "clicks", "*.csv")))
@@ -290,6 +300,7 @@ for c_id, parts in clicks_by_id.items():
 
 # ---------------------------------------------------------
 # DuckDB Analytics & Output Tables
+log_step("Starting DuckDB analytics & aggregation...")
 # ---------------------------------------------------------
 
 con = duckdb.connect()
@@ -546,4 +557,4 @@ con.execute(f"""
     ) TO '{os.path.join(OUT, "campaign_daily", "part-0.parquet")}' (FORMAT parquet)
 """)
 
-print("pipeline finished successfully")
+log_step("pipeline finished successfully")
