@@ -950,6 +950,21 @@ fn make_chunks(maps: &[Mmap], kind_of: &[u8], out: &mut Vec<(u8, Chunk)>) {
     }
 }
 
+/// Drops this process's page mappings for the whole pages inside [start, end) of a
+/// read-only file mapping once a worker is done with them. Tearing down ~1.8 GB of input
+/// mappings at exit took ~0.12 s on one core; done per chunk it is spread over all workers.
+/// The page cache keeps the data, so a later read of a boundary page simply faults it back.
+fn release_chunk(m: &Mmap, c: Chunk) {
+    let base = m.as_ptr() as usize;
+    let lo = (base + c.start + 4095) & !4095;
+    let hi = (base + c.end) & !4095;
+    if hi > lo {
+        unsafe {
+            libc::madvise(lo as *mut libc::c_void, hi - lo, libc::MADV_DONTNEED);
+        }
+    }
+}
+
 /// The whole lines owned by byte range [start, end) of `m`: the first is the one after the
 /// first '\n' at or after `start - 1` (for start 0 this skips the header line), the last is
 /// the one containing byte `end - 1`.
@@ -1146,6 +1161,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     st.1[lpart(khash(a))].push((a, slot));
                     st.1[lpart(khash(bk))].push((bk, slot + 1));
                 });
+                release_chunk(&maps[c.file], c);
             },
         );
         let mut toff = vec![0usize; link_states.len() + 1];
@@ -1302,6 +1318,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     st.ev[ebucket(khash(eid), ne_mask)].push(rec);
                 });
+                release_chunk(&maps[c.file], c);
             },
         );
         (h.join().unwrap(), pstates)
@@ -1348,6 +1365,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             });
             flush_clicks(st, &pmap);
+            release_chunk(&maps[c.file], c);
         },
     );
     lg("parse done");
