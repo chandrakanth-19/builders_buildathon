@@ -37,7 +37,7 @@ use parquet::schema::types::ColumnPath;
 struct HugeAlloc;
 /// Whether to request transparent huge pages (MADV_HUGEPAGE); see `main`.
 static USE_THP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-const ARENA_MIN: usize = 16 << 10; // [ARENA_MIN, BIG): per-thread huge-page bump arenas
+const ARENA_MIN: usize = 4 << 10; // [ARENA_MIN, BIG): per-thread huge-page bump arenas
 const BIG: usize = 4 << 20; // >= BIG: dedicated mmap
 const HUGE: usize = 2 << 20;
 const ARENA_REGION: usize = 64 << 20;
@@ -102,14 +102,81 @@ unsafe fn arena_alloc(size: usize, align: usize) -> *mut u8 {
     })
 }
 
-/// Returns the block to the arena only if it is the most recent allocation.
-unsafe fn arena_free(p: *mut u8, size: usize) {
-    ARENA.with(|a| {
-        let (cur, end) = a.get();
-        if p as usize + size == cur {
-            a.set((p as usize, end));
+// Arena blocks come in size classes 2^k and 1.5*2^k (>= ARENA_MIN), so a freed block can
+// be reused by any later request of the same class. Free blocks sit on global intrusive
+// lists (one per class, spinlock-protected): no syscalls, hence no TLB shootdowns, and
+// memory freed in one phase is reused by the next (pool threads are per phase).
+#[inline(always)]
+fn arena_class(size: usize) -> (usize, usize) {
+    let s = size.max(ARENA_MIN);
+    let c = if s.is_power_of_two() {
+        s
+    } else {
+        let p2 = s.next_power_of_two();
+        let h = p2 / 2;
+        if s <= h + h / 2 { h + h / 2 } else { p2 }
+    };
+    let tz = c.trailing_zeros() as usize;
+    (c, 2 * tz + (!c.is_power_of_two()) as usize)
+}
+
+struct FreeList {
+    lock: std::sync::atomic::AtomicBool,
+    head: std::cell::UnsafeCell<usize>,
+}
+unsafe impl Sync for FreeList {}
+const FREE_LIST_INIT: FreeList =
+    FreeList { lock: std::sync::atomic::AtomicBool::new(false), head: std::cell::UnsafeCell::new(0) };
+static FREE_LISTS: [FreeList; 64] = [FREE_LIST_INIT; 64];
+
+impl FreeList {
+    #[inline(always)]
+    fn with<R>(&self, f: impl FnOnce(&mut usize) -> R) -> R {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+        while self.lock.compare_exchange_weak(false, true, Acquire, Relaxed).is_err() {
+            std::hint::spin_loop();
         }
-    })
+        let r = f(unsafe { &mut *self.head.get() });
+        self.lock.store(false, Release);
+        r
+    }
+}
+
+unsafe fn class_alloc(size: usize, align: usize) -> *mut u8 {
+    let (c, idx) = arena_class(size);
+    if align <= 64 {
+        let p = FREE_LISTS[idx].with(|h| {
+            let p = *h;
+            if p != 0 {
+                *h = *(p as *const usize);
+            }
+            p
+        });
+        if p != 0 {
+            return p as *mut u8;
+        }
+    }
+    arena_alloc(c, align)
+}
+
+/// Rewinds the arena if this is its most recent block, otherwise puts it on its free list.
+unsafe fn class_free(p: *mut u8, size: usize) {
+    let (c, idx) = arena_class(size);
+    let rewound = ARENA.with(|a| {
+        let (cur, end) = a.get();
+        if p as usize + c == cur {
+            a.set((p as usize, end));
+            true
+        } else {
+            false
+        }
+    });
+    if !rewound {
+        FREE_LISTS[idx].with(|h| {
+            *(p as *mut usize) = *h;
+            *h = p as usize;
+        });
+    }
 }
 
 unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
@@ -117,7 +184,7 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
         match class(&l) {
             0 => std::alloc::System.alloc(l),
-            1 => arena_alloc(l.size(), l.align()),
+            1 => class_alloc(l.size(), l.align()),
             _ => big_map(l.size()),
         }
     }
@@ -126,9 +193,9 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
         match class(&l) {
             0 => std::alloc::System.alloc_zeroed(l),
             1 => {
-                let p = arena_alloc(l.size(), l.align());
+                let p = class_alloc(l.size(), l.align());
                 if !p.is_null() {
-                    // arena memory may be recycled from a rewound block
+                    // arena memory may be recycled from a freed block
                     std::ptr::write_bytes(p, 0, l.size());
                 }
                 p
@@ -140,7 +207,7 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
         match class(&l) {
             0 => std::alloc::System.dealloc(p, l),
-            1 => arena_free(p, l.size()),
+            1 => class_free(p, l.size()),
             _ => {
                 libc::munmap(p as *mut libc::c_void, round_up(l.size()));
             }
@@ -169,11 +236,16 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
             return q as *mut u8;
         }
         if co == 1 && cn == 1 {
+            let (oc, _) = arena_class(l.size());
+            let (nc, _) = arena_class(new_size);
+            if oc == nc {
+                return p; // same size class: the block already fits
+            }
             // grow/shrink in place when this is the arena's most recent block
             let grown = ARENA.with(|a| {
                 let (cur, end) = a.get();
-                if p as usize + l.size() == cur && p as usize + new_size <= end {
-                    a.set((p as usize + new_size, end));
+                if p as usize + oc == cur && p as usize + nc <= end {
+                    a.set((p as usize + nc, end));
                     true
                 } else {
                     false
@@ -734,7 +806,7 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 /// Every block is BLOCK_BYTES regardless of element type, so blocks freed by one phase
 /// (event-id buckets after dedup) are reused by the next (person buckets) without new page
 /// faults.
-const BLOCK_BYTES: usize = 24 << 10;
+const BLOCK_BYTES: usize = 4 << 10;
 
 thread_local! {
     static FREE_BLOCKS: std::cell::UnsafeCell<Vec<usize>> = const { std::cell::UnsafeCell::new(Vec::new()) };
@@ -760,6 +832,8 @@ fn alloc_block() -> *mut u8 {
 struct BlockVec<T: Copy> {
     blocks: Vec<*mut T>,
     len: usize,
+    cur: *mut T, // next free slot in the last block
+    left: usize, // free slots left in the last block
 }
 unsafe impl<T: Copy + Send> Send for BlockVec<T> {}
 unsafe impl<T: Copy + Sync> Sync for BlockVec<T> {}
@@ -768,7 +842,7 @@ impl<T: Copy> BlockVec<T> {
     const CAP: usize = BLOCK_BYTES / std::mem::size_of::<T>();
 
     fn new() -> Self {
-        BlockVec { blocks: Vec::new(), len: 0 }
+        BlockVec { blocks: Vec::new(), len: 0, cur: std::ptr::null_mut(), left: 0 }
     }
     #[inline(always)]
     fn len(&self) -> usize {
@@ -776,11 +850,17 @@ impl<T: Copy> BlockVec<T> {
     }
     #[inline(always)]
     fn push(&mut self, v: T) {
-        let off = self.len % Self::CAP;
-        if off == 0 {
-            self.blocks.push(alloc_block() as *mut T);
+        if self.left == 0 {
+            let p = alloc_block() as *mut T;
+            self.blocks.push(p);
+            self.cur = p;
+            self.left = Self::CAP;
         }
-        unsafe { self.blocks.last().unwrap_unchecked().add(off).write(v) };
+        unsafe {
+            self.cur.write(v);
+            self.cur = self.cur.add(1);
+        }
+        self.left -= 1;
         self.len += 1;
     }
     #[inline(always)]
@@ -1389,26 +1469,29 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
             // Sequential scan; resolve persons in batches with prefetching.
-            let mut cand = [(0u32, 0u64); 32];
+            let mut cand: [(*const ERec, u64); 32] = [(std::ptr::null(), 0); 32];
             for src in pstates.iter() {
                 let v = &src.ev[b];
-                let mut ri = 0usize;
-                while ri < v.len() {
-                    let mut n = 0usize;
-                    while ri < v.len() && n < 32 {
-                        let r = &v[ri];
-                        if r.ts != TS_NONE {
-                            let h = khash(r.user);
-                            pmap.prefetch(h);
-                            cand[n] = (ri as u32, h);
-                            n += 1;
+                for bi in 0..v.blocks.len() {
+                    let blk = v.block(bi);
+                    let mut ri = 0usize;
+                    while ri < blk.len() {
+                        let mut n = 0usize;
+                        while ri < blk.len() && n < 32 {
+                            let r = &blk[ri];
+                            if r.ts != TS_NONE {
+                                let h = khash(r.user);
+                                pmap.prefetch(h);
+                                cand[n] = (r as *const ERec, h);
+                                n += 1;
+                            }
+                            ri += 1;
                         }
-                        ri += 1;
-                    }
-                    for &(ci, h) in &cand[..n] {
-                        let r = &v[ci as usize];
-                        let person = pmap.get(r.user, h);
-                        out[pbucket(khash(person))].push(PRec { person, ts: r.ts, pc: r.pc });
+                        for &(rp, h) in &cand[..n] {
+                            let r = unsafe { &*rp };
+                            let person = pmap.get(r.user, h);
+                            out[pbucket(khash(person))].push(PRec { person, ts: r.ts, pc: r.pc });
+                        }
                     }
                 }
             }
