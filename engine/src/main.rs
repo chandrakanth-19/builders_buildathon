@@ -905,6 +905,7 @@ impl<T: Copy> std::ops::Index<usize> for BlockVec<T> {
 const TS_NONE: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
+#[repr(C, packed(4))] // 44 bytes instead of 48; fields are only read by value
 struct ERec {
     eid: Key,
     user: Key,
