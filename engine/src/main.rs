@@ -306,7 +306,30 @@ type LongMap = KMap<(usize, u32)>;
 /// Long-ID byte tables: those recorded while parsing links (needed for person names
 /// during link processing) and those recorded while parsing events and clicks.
 static LINK_LONG: OnceLock<Vec<LongMap>> = OnceLock::new();
+/// Recorded while parsing events and clicks, partitioned by `long_part(khash(key))`.
 static DATA_LONG: OnceLock<Vec<LongMap>> = OnceLock::new();
+const LONG_PARTS: usize = 64;
+
+#[inline(always)]
+fn long_part(h: u64) -> usize {
+    ((h >> 40) as usize) & (LONG_PARTS - 1)
+}
+
+/// Per-thread, append-only record of long IDs seen while parsing, partitioned like
+/// DATA_LONG (appending is much cheaper than a hash-map insert per occurrence); the
+/// partitions are merged into maps in parallel once parsing is done.
+type LongLog = Vec<Vec<(Key, usize, u32)>>;
+
+fn long_log() -> LongLog {
+    (0..LONG_PARTS).map(|_| Vec::new()).collect()
+}
+
+#[inline(always)]
+fn log_long(log: &mut LongLog, k: Key, b: &[u8]) {
+    if k.is_long() {
+        log[long_part(khash(k))].push((k, b.as_ptr() as usize, b.len() as u32));
+    }
+}
 
 #[inline]
 fn long_key(b: &[u8]) -> Key {
@@ -343,14 +366,14 @@ fn note_long(map: &mut LongMap, k: Key, b: &[u8]) {
 }
 
 fn long_bytes(k: Key) -> &'static [u8] {
-    for tables in [LINK_LONG.get(), DATA_LONG.get()].into_iter().flatten() {
-        for t in tables {
-            if let Some(&(p, l)) = t.get(&k) {
-                return unsafe { std::slice::from_raw_parts(p as *const u8, l as usize) };
-            }
-        }
+    let found = DATA_LONG
+        .get()
+        .and_then(|d| d[long_part(khash(k))].get(&k).copied())
+        .or_else(|| LINK_LONG.get().and_then(|ts| ts.iter().find_map(|t| t.get(&k).copied())));
+    match found {
+        Some((p, l)) => unsafe { std::slice::from_raw_parts(p as *const u8, l as usize) },
+        None => panic!("bytes of a long ID were not recorded"),
     }
-    panic!("bytes of a long ID were not recorded");
 }
 
 /// The first 15 bytes of a key's ID, zero-padded, as a big-endian integer. If two IDs'
@@ -1378,7 +1401,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- 4. parse events + clicks -------------------------------------------
     struct PState {
         ev: Vec<BlockVec<ERec>>,
-        long: LongMap, // bytes of long user IDs (for writing person names)
+        long: LongLog, // long user IDs seen (for writing person names)
     }
     // Event-id buckets: ~20K events each keeps every dedup hash table cache-resident.
     let ev_bytes: usize = ev_chunks.iter().map(|c| c.end - c.start).sum();
@@ -1389,7 +1412,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let pstates = pool(
             nt,
             ev_chunks.len(),
-            || PState { ev: (0..ne).map(|_| BlockVec::new()).collect(), long: LongMap::default() },
+            || PState { ev: (0..ne).map(|_| BlockVec::new()).collect(), long: long_log() },
             |st, i| {
                 let c = ev_chunks[i];
                 let b = chunk_lines(&maps[c.file], c);
@@ -1423,7 +1446,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 if valid {
                                     rec.ts = (ts - base) as u32;
                                     rec.user = key_fast(f[1], end);
-                                    note_long(&mut st.long, rec.user, f[1]);
+                                    log_long(&mut st.long, rec.user, f[1]);
                                 }
                             }
                         }
@@ -1434,12 +1457,12 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
         (h.join().unwrap(), pstates)
     });
-    let mut pstates = pstates;
+    let pstates = pstates;
     lg(&format!("events parsed ({} event buckets)", ne));
     struct CState {
         ck: Vec<BlockVec<CRec>>,
         pend: Vec<(Key, u64, Key, u32, u32)>,
-        long: LongMap, // bytes of long click IDs (for click_id tie-breaks)
+        long: LongLog, // long click IDs seen (for click_id tie-breaks)
     }
     #[inline(always)]
     fn flush_clicks(st: &mut CState, pmap: &PMap) {
@@ -1452,7 +1475,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cstates = pool(
         nt,
         ck_chunks.len(),
-        || CState { ck: (0..NP).map(|_| BlockVec::new()).collect(), pend: Vec::with_capacity(32), long: LongMap::default() },
+        || CState { ck: (0..NP).map(|_| BlockVec::new()).collect(), pend: Vec::with_capacity(32), long: long_log() },
         |st, i| {
             let c = ck_chunks[i];
             let b = chunk_lines(&maps[c.file], c);
@@ -1473,7 +1496,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let h = khash(user);
                 pmap.prefetch(h);
                 let click = key_fast(f[0], end);
-                note_long(&mut st.long, click, f[0]);
+                log_long(&mut st.long, click, f[0]);
                 st.pend.push((user, h, click, (ts - base) as u32, camp));
                 if st.pend.len() == 32 {
                     flush_clicks(st, &pmap);
@@ -1482,14 +1505,23 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             flush_clicks(st, &pmap);
         },
     );
-    let mut cstates = cstates;
-    let _ = DATA_LONG.set(
-        pstates
-            .iter_mut()
-            .map(|s| std::mem::take(&mut s.long))
-            .chain(cstates.iter_mut().map(|s| std::mem::take(&mut s.long)))
-            .collect(),
-    );
+    {
+        // merge the per-thread long-ID logs into one map per partition, in parallel
+        let logs: Vec<&LongLog> = pstates.iter().map(|s| &s.long).chain(cstates.iter().map(|s| &s.long)).collect();
+        let cells: Vec<Mutex<LongMap>> = (0..LONG_PARTS).map(|_| Mutex::new(LongMap::default())).collect();
+        pool(nt, LONG_PARTS, || (), |_, p| {
+            let n: usize = logs.iter().map(|l| l[p].len()).sum();
+            let mut m = LongMap::default();
+            m.reserve(n / 4 + 16);
+            for l in &logs {
+                for &(k, a, len) in &l[p] {
+                    m.entry(k).or_insert((a, len));
+                }
+            }
+            *cells[p].lock().unwrap() = m;
+        });
+        let _ = DATA_LONG.set(cells.into_iter().map(|c| c.into_inner().unwrap()).collect());
+    }
     lg("parse done");
 
     // --- 5. dedup events per event bucket -> person buckets -----------------
