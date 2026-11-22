@@ -292,41 +292,78 @@ impl Key {
     }
 }
 
-struct LongTable {
-    map: HashMap<Vec<u8>, u64>,
-    strs: Vec<Vec<u8>>,
-}
+// IDs longer than 15 bytes (1 in 8 IDs since shopping-sessions-5: a prefix plus 32 hex
+// digits) are keyed by a 120-bit hash instead of their bytes: no shared table, no locks.
+// Equality of long keys is equality of hashes (collision odds for millions of IDs are
+// ~1e-23). Only user and click IDs ever need their bytes back (byte-wise ordering for
+// person names and click tie-breaks, and writing names out); the threads that parse them
+// record key -> location of the bytes inside the input mapping, which stays mapped until
+// the process exits, so nothing is copied.
 
-static LONG: OnceLock<Mutex<LongTable>> = OnceLock::new();
+/// Where a long ID's bytes live: (address, length) inside the input mappings.
+type LongMap = KMap<(usize, u32)>;
 
-fn long_table() -> &'static Mutex<LongTable> {
-    LONG.get_or_init(|| {
-        Mutex::new(LongTable {
-            map: HashMap::new(),
-            strs: Vec::new(),
-        })
-    })
-}
+/// Long-ID byte tables: those recorded while parsing links (needed for person names
+/// during link processing) and those recorded while parsing events and clicks.
+static LINK_LONG: OnceLock<Vec<LongMap>> = OnceLock::new();
+static DATA_LONG: OnceLock<Vec<LongMap>> = OnceLock::new();
 
 #[cold]
 #[inline(never)]
 fn long_key(b: &[u8]) -> Key {
-    let mut t = long_table().lock().unwrap();
-    let id = match t.map.get(b) {
-        Some(&id) => id,
-        None => {
-            let id = t.strs.len() as u64;
-            t.strs.push(b.to_vec());
-            t.map.insert(b.to_vec(), id);
-            id
-        }
-    };
-    let mut h = [0u8; 8];
-    h.copy_from_slice(&b[..8]);
-    Key {
-        hi: u64::from_be_bytes(h),
-        lo: (id << 8) | 0xFF,
+    // Two 64-bit lanes over little-endian 8-byte words (zero-padded tail), seeded with the
+    // length; the second lane sees rotated words so the lanes stay independent.
+    let n = b.len() as u64;
+    let mut h1: u64 = 0x243F_6A88_85A3_08D3 ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut h2: u64 = 0x1319_8A2E_0370_7344 ^ n.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    let mut chunks = b.chunks_exact(8);
+    for c in &mut chunks {
+        let w = u64::from_le_bytes(c.try_into().unwrap());
+        h1 = fold(h1 ^ w, 0x9E37_79B9_7F4A_7C15);
+        h2 = fold(h2 ^ w.rotate_left(29), 0xD6E8_FEB8_6659_FD93);
     }
+    let rem = chunks.remainder();
+    if !rem.is_empty() {
+        let mut t = [0u8; 8];
+        t[..rem.len()].copy_from_slice(rem);
+        let w = u64::from_le_bytes(t);
+        h1 = fold(h1 ^ w, 0x9E37_79B9_7F4A_7C15);
+        h2 = fold(h2 ^ w.rotate_left(29), 0xD6E8_FEB8_6659_FD93);
+    }
+    let f1 = fold(h1 ^ 0xA076_1D64_78BD_642F, h2 ^ 0xE703_7ED1_A0B4_28DB);
+    let f2 = fold(h2 ^ 0x8EBC_6AF0_9C88_C6E3, h1 ^ 0x5899_65CC_7537_4CC3);
+    Key { hi: f1, lo: (f2 << 8) | 0xFF }
+}
+
+/// Records where a long ID's bytes are (no-op for short IDs).
+#[inline(always)]
+fn note_long(map: &mut LongMap, k: Key, b: &[u8]) {
+    if k.is_long() {
+        map.entry(k).or_insert((b.as_ptr() as usize, b.len() as u32));
+    }
+}
+
+fn long_bytes(k: Key) -> &'static [u8] {
+    for tables in [LINK_LONG.get(), DATA_LONG.get()].into_iter().flatten() {
+        for t in tables {
+            if let Some(&(p, l)) = t.get(&k) {
+                return unsafe { std::slice::from_raw_parts(p as *const u8, l as usize) };
+            }
+        }
+    }
+    panic!("bytes of a long ID were not recorded");
+}
+
+/// The bytes behind a key (short keys decode into `buf`).
+#[inline(always)]
+fn key_slice(k: Key, buf: &mut [u8; 16]) -> &[u8] {
+    if k.is_long() {
+        return long_bytes(k);
+    }
+    buf[0..8].copy_from_slice(&k.hi.to_be_bytes());
+    buf[8..16].copy_from_slice(&k.lo.to_be_bytes());
+    let n = buf[15] as usize;
+    &buf[..n]
 }
 
 #[inline(always)]
@@ -367,29 +404,10 @@ fn key_fast(f: &[u8], end: usize) -> Key {
     Key { hi, lo: lo | n as u64 }
 }
 
-fn key_bytes(k: Key) -> Vec<u8> {
-    if k.is_long() {
-        let t = long_table().lock().unwrap();
-        return t.strs[(k.lo >> 8) as usize].clone();
-    }
-    let mut buf = [0u8; 16];
-    buf[0..8].copy_from_slice(&k.hi.to_be_bytes());
-    buf[8..16].copy_from_slice(&k.lo.to_be_bytes());
-    let n = buf[15] as usize;
-    buf[..n].to_vec()
-}
-
 #[inline(always)]
 fn write_key(k: Key, out: &mut Vec<u8>) {
-    if k.is_long() {
-        out.extend_from_slice(&key_bytes(k));
-        return;
-    }
     let mut buf = [0u8; 16];
-    buf[0..8].copy_from_slice(&k.hi.to_be_bytes());
-    buf[8..16].copy_from_slice(&k.lo.to_be_bytes());
-    let n = buf[15] as usize;
-    out.extend_from_slice(&buf[..n]);
+    out.extend_from_slice(key_slice(k, &mut buf));
 }
 
 /// Byte-wise string order of the IDs behind two keys.
@@ -398,7 +416,8 @@ fn key_cmp(a: Key, b: Key) -> std::cmp::Ordering {
     if !a.is_long() && !b.is_long() {
         a.cmp(&b)
     } else {
-        key_bytes(a).cmp(&key_bytes(b))
+        let (mut x, mut y) = ([0u8; 16], [0u8; 16]);
+        key_slice(a, &mut x).cmp(key_slice(b, &mut y))
     }
 }
 
@@ -1209,10 +1228,10 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         // Parse pairs: each endpoint goes to its key partition tagged with its slot
         // (2 * thread-local pair index + side); pairs themselves are only counted.
-        let link_states = pool(
+        let mut link_states = pool(
             lt,
             link_chunks.len(),
-            || (0u32, (0..LP).map(|_| Vec::<(Key, u32)>::new()).collect::<Vec<_>>()),
+            || (0u32, (0..LP).map(|_| Vec::<(Key, u32)>::new()).collect::<Vec<_>>(), LongMap::default()),
             |st, i| {
                 let c = link_chunks[i];
                 let b = chunk_lines(&maps[c.file], c);
@@ -1222,6 +1241,8 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                     let a = key_of(f[0]);
                     let bk = key_of(f[1]);
+                    note_long(&mut st.2, a, f[0]);
+                    note_long(&mut st.2, bk, f[1]);
                     let slot = st.0 * 2;
                     st.0 += 1;
                     st.1[lpart(khash(a))].push((a, slot));
@@ -1229,6 +1250,8 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 });
             },
         );
+        // long link IDs' bytes, needed to pick each person's byte-wise smallest name
+        let _ = LINK_LONG.set(link_states.iter_mut().map(|s| std::mem::take(&mut s.2)).collect());
         let mut toff = vec![0usize; link_states.len() + 1];
         for (t, s) in link_states.iter().enumerate() {
             toff[t + 1] = toff[t] + s.0 as usize;
@@ -1333,6 +1356,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // --- 4. parse events + clicks -------------------------------------------
     struct PState {
         ev: Vec<BlockVec<ERec>>,
+        long: LongMap, // bytes of long user IDs (for writing person names)
     }
     // Event-id buckets: ~20K events each keeps every dedup hash table cache-resident.
     let ev_bytes: usize = ev_chunks.iter().map(|c| c.end - c.start).sum();
@@ -1343,7 +1367,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let pstates = pool(
             nt,
             ev_chunks.len(),
-            || PState { ev: (0..ne).map(|_| BlockVec::new()).collect() },
+            || PState { ev: (0..ne).map(|_| BlockVec::new()).collect(), long: LongMap::default() },
             |st, i| {
                 let c = ev_chunks[i];
                 let b = chunk_lines(&maps[c.file], c);
@@ -1377,6 +1401,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 if valid {
                                     rec.ts = (ts - base) as u32;
                                     rec.user = key_fast(f[1], end);
+                                    note_long(&mut st.long, rec.user, f[1]);
                                 }
                             }
                         }
@@ -1387,10 +1412,12 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         );
         (h.join().unwrap(), pstates)
     });
+    let mut pstates = pstates;
     lg(&format!("events parsed ({} event buckets)", ne));
     struct CState {
         ck: Vec<BlockVec<CRec>>,
         pend: Vec<(Key, u64, Key, u32, u32)>,
+        long: LongMap, // bytes of long click IDs (for click_id tie-breaks)
     }
     #[inline(always)]
     fn flush_clicks(st: &mut CState, pmap: &PMap) {
@@ -1403,7 +1430,7 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cstates = pool(
         nt,
         ck_chunks.len(),
-        || CState { ck: (0..NP).map(|_| BlockVec::new()).collect(), pend: Vec::with_capacity(32) },
+        || CState { ck: (0..NP).map(|_| BlockVec::new()).collect(), pend: Vec::with_capacity(32), long: LongMap::default() },
         |st, i| {
             let c = ck_chunks[i];
             let b = chunk_lines(&maps[c.file], c);
@@ -1423,13 +1450,23 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let user = key_fast(f[1], end);
                 let h = khash(user);
                 pmap.prefetch(h);
-                st.pend.push((user, h, key_fast(f[0], end), (ts - base) as u32, camp));
+                let click = key_fast(f[0], end);
+                note_long(&mut st.long, click, f[0]);
+                st.pend.push((user, h, click, (ts - base) as u32, camp));
                 if st.pend.len() == 32 {
                     flush_clicks(st, &pmap);
                 }
             });
             flush_clicks(st, &pmap);
         },
+    );
+    let mut cstates = cstates;
+    let _ = DATA_LONG.set(
+        pstates
+            .iter_mut()
+            .map(|s| std::mem::take(&mut s.long))
+            .chain(cstates.iter_mut().map(|s| std::mem::take(&mut s.long)))
+            .collect(),
     );
     lg("parse done");
 
@@ -2171,6 +2208,39 @@ mod tests {
                 start = end;
             }
             assert_eq!(got, expect, "size {size} buf {:?}", String::from_utf8_lossy(&buf));
+        }
+    }
+    #[test]
+    fn long_id_keys_do_not_collide() {
+        let mut x: u64 = 0xDEAD_BEEF_1234_5678;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut seen = std::collections::HashSet::with_capacity(3_000_000);
+        for i in 0..3_000_000u64 {
+            let prefix = [b'u', b'e', b'k', b'U'][(i % 4) as usize];
+            // random 32-hex-digit suffix, and every 16th one differs from the previous
+            // value in a single digit (near-identical inputs)
+            let (h, l) = (rnd(), rnd());
+            let mut id = format!("{}{:016x}{:016x}", prefix as char, h, l).into_bytes();
+            if i % 16 == 0 {
+                let j = 1 + (rnd() % 32) as usize;
+                id[j] = if id[j] == b'0' { b'1' } else { b'0' };
+            }
+            let k = key_of(&id);
+            assert!(k.is_long());
+            seen.insert((k.hi, k.lo, id));
+        }
+        let keys: std::collections::HashSet<(u64, u64)> = seen.iter().map(|t| (t.0, t.1)).collect();
+        let ids: std::collections::HashSet<&Vec<u8>> = seen.iter().map(|t| &t.2).collect();
+        assert_eq!(keys.len(), ids.len(), "hash collision among long IDs");
+        // short keys never look long
+        for n in 0..=15usize {
+            let v = vec![0xFFu8; n];
+            assert!(!key_of(&v).is_long());
         }
     }
 }
