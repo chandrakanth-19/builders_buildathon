@@ -308,8 +308,7 @@ type LongMap = KMap<(usize, u32)>;
 static LINK_LONG: OnceLock<Vec<LongMap>> = OnceLock::new();
 static DATA_LONG: OnceLock<Vec<LongMap>> = OnceLock::new();
 
-#[cold]
-#[inline(never)]
+#[inline]
 fn long_key(b: &[u8]) -> Key {
     // Two 64-bit lanes over little-endian 8-byte words (zero-padded tail), seeded with the
     // length; the second lane sees rotated words so the lanes stay independent.
@@ -352,6 +351,17 @@ fn long_bytes(k: Key) -> &'static [u8] {
         }
     }
     panic!("bytes of a long ID were not recorded");
+}
+
+/// The first 15 bytes of a key's ID, zero-padded, as a big-endian integer. If two IDs'
+/// prefixes differ, their order equals the IDs' byte-wise order; equal prefixes say nothing.
+fn key_prefix(k: Key) -> u128 {
+    let mut buf = [0u8; 16];
+    let b = key_slice(k, &mut buf);
+    let mut p = [0u8; 16];
+    let n = b.len().min(15);
+    p[..n].copy_from_slice(&b[..n]);
+    u128::from_be_bytes(p)
 }
 
 /// The bytes behind a key (short keys decode into `buf`).
@@ -1315,7 +1325,12 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for p in 0..LP {
             node_key.extend_from_slice(&part_keys[p]);
         }
+        // Byte-wise smallest ID per component. Compare 15-byte prefixes first (computed once
+        // per node; for long IDs this is the only byte lookup) and fall back to the full
+        // comparison only when the prefixes tie.
+        let prefix: Vec<u128> = node_key.iter().map(|&k| key_prefix(k)).collect();
         let mut root_min: Vec<Key> = vec![Key::default(); nnodes];
+        let mut min_prefix: Vec<u128> = vec![0; nnodes];
         let mut has_min = vec![false; nnodes];
         let mut roots: Vec<u32> = vec![0; nnodes];
         for i in 0..nnodes {
@@ -1323,8 +1338,15 @@ fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             roots[i] = r;
             let k = node_key[i];
             let r = r as usize;
-            if !has_min[r] || key_cmp(k, root_min[r]) == std::cmp::Ordering::Less {
+            let better = !has_min[r]
+                || match prefix[i].cmp(&min_prefix[r]) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Greater => false,
+                    std::cmp::Ordering::Equal => key_cmp(k, root_min[r]) == std::cmp::Ordering::Less,
+                };
+            if better {
                 root_min[r] = k;
+                min_prefix[r] = prefix[i];
                 has_min[r] = true;
             }
         }
